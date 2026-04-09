@@ -1,0 +1,15 @@
+# requirements.txt
+# pip install -r requirements.txt
+
+# GPIO 제어
+RPi.GPIO>=0.7.1
+
+# ToF 센서 (VL53L1X)
+VL53L1X>=0.0.2
+smbus2>=0.4.3
+
+# (대안) Adafruit VL53L0X 사용 시
+# adafruit-circuitpython-vl53l0x
+
+# 유틸리티
+dataclasses       # Python 3.6 이하에서만 필요 (3.7+ 기본 내장)
