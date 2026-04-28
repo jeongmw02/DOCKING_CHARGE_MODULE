@@ -51,9 +51,9 @@ SOLAR_PANEL_STOWED_DEG   = 0
 SOLAR_PANEL_DEPLOYED_DEG = 90
 
 # ── 전자석 ──────────────────────────────────────────────
-ELECTROMAGNET_PULL_DUTY = 100
-ELECTROMAGNET_HOLD_DUTY = 80
-ELECTROMAGNET_PULL_MS   = 500
+ELECTROMAGNET_PULL_DUTY = 100   # % - 초기 흡착 풀 파워
+ELECTROMAGNET_HOLD_DUTY = 40    # % - 유지 절전 모드
+ELECTROMAGNET_PULL_MS   = 500   # ms - 풀 파워 유지 시간
 
 # ── 로깅 ────────────────────────────────────────────────
 LOG_LEVEL   = "DEBUG"
