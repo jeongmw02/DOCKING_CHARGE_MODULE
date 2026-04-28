@@ -1,11 +1,11 @@
-from .tof_sensor    import ToFSensorArray, SensorReading
+from .tof_sensor    import ToFSensor, SensorReading
 from .electromagnet import Electromagnet
 from .stepper       import StepperMotor
 from .servo         import ServoMotor, SolarPanelArray
 from .pogo_pin      import PogoPinCharger, ChargeStatus
 
 __all__ = [
-    "ToFSensorArray", "SensorReading",
+    "ToFSensor", "SensorReading",
     "Electromagnet",
     "StepperMotor",
     "ServoMotor", "SolarPanelArray",
