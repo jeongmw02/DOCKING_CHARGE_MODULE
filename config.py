@@ -29,11 +29,20 @@ SERVO_FREQ_HZ     = 50
 POGO_DETECT_PIN    = 16
 POGO_CHARGE_EN_PIN = 20
 
-# ── 상태 머신 임계값 ────────────────────────────────────
-APPROACH_START_DIST_MM = 300
-SOFT_CAPTURE_DIST_MM   = 50
-HARD_LOCK_CONFIRM_MM   = 10
-ALIGNMENT_TOLERANCE_MM = 5
+# ── 상태 머신 임계값 (main_ver1.py 기준) ────────────────
+SOFT_CAPTURE_DIST_MM    = 300   # mm - ToF ≤ 이 값 3s 지속 → SOFT_CAPTURE
+HARD_LOCK_DIST_MM       = 70    # mm - ToF ≤ 이 값 5s 지속 → HARD_LOCK
+ALIGNMENT_TOLERANCE_MM  = 5
+
+# ── 상태 머신 타이머 ─────────────────────────────────────
+SOFT_CAPTURE_HOLD_S     = 3.0   # 초 - SOFT_CAPTURE 진입 조건 지속 시간
+HARD_LOCK_HOLD_S        = 5.0   # 초 - HARD_LOCK 진입 조건 지속 시간
+DOCKED_WAIT_S           = 2.0   # 초 - 모터 step0 도달 후 DOCKED 전환 대기
+MARKER_LOST_TIMEOUT_S   = 1.5   # 초 - TARGET_LOCK 마커 소실 유예 시간
+
+# ── 모터 ─────────────────────────────────────────────────
+MOTOR_TARGET_STEPS      = 3000  # 도킹 시 전진 스텝
+MOTOR_STEP_DELAY_S      = 0.001 # 스텝당 딜레이 (1ms → 3000스텝 ≈ 3초)
 
 # ── 속도 ────────────────────────────────────────────────
 APPROACH_SPEED_MM_S = 10.0
