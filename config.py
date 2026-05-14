@@ -12,9 +12,9 @@ TOF_I2C_ADDRESSES = [0x30, 0x31, 0x32]
 # 전자석
 ELECTROMAGNET_PIN = 18
 
-# 스테퍼 모터 (NEMA17 + DRV8825)
-STEPPER_STEP_PIN      = 23
-STEPPER_DIR_PIN       = 24
+# 스테퍼 모터 (NEMA17 + A4988)
+STEPPER_STEP_PIN      = 12   # 실제 배선 핀
+STEPPER_DIR_PIN       = 17   # 실제 배선 핀
 STEPPER_EN_PIN        = 25
 STEPPER_STEPS_PER_REV = 200
 STEPPER_MICROSTEP     = 8
@@ -31,7 +31,7 @@ POGO_CHARGE_EN_PIN = 20
 
 # ── 상태 머신 임계값 (main_ver1.py 기준) ────────────────
 SOFT_CAPTURE_DIST_MM    = 300   # mm - ToF ≤ 이 값 3s 지속 → SOFT_CAPTURE
-HARD_LOCK_DIST_MM       = 70    # mm - ToF ≤ 이 값 5s 지속 → HARD_LOCK
+HARD_LOCK_DIST_MM       = 150    # mm - ToF ≤ 이 값 5s 지속 → HARD_LOCK
 ALIGNMENT_TOLERANCE_MM  = 5
 
 # ── 상태 머신 타이머 ─────────────────────────────────────
@@ -42,7 +42,7 @@ MARKER_LOST_TIMEOUT_S   = 1.5   # 초 - TARGET_LOCK 마커 소실 유예 시간
 
 # ── 모터 ─────────────────────────────────────────────────
 MOTOR_TARGET_STEPS      = 3000  # 도킹 시 전진 스텝
-MOTOR_STEP_DELAY_S      = 0.001 # 스텝당 딜레이 (1ms → 3000스텝 ≈ 3초)
+MOTOR_STEP_DELAY_S      = 0.005 # 스텝당 딜레이 (5ms, 실제 작동 확인값)
 
 # ── 속도 ────────────────────────────────────────────────
 APPROACH_SPEED_MM_S = 10.0

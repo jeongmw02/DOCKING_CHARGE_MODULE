@@ -61,7 +61,6 @@ if GPIO_OK:
     GPIO.setup(config.ELECTROMAGNET_PIN,  GPIO.OUT, initial=GPIO.LOW)
     GPIO.setup(config.STEPPER_STEP_PIN,   GPIO.OUT, initial=GPIO.LOW)
     GPIO.setup(config.STEPPER_DIR_PIN,    GPIO.OUT, initial=GPIO.HIGH)
-    GPIO.setup(config.STEPPER_EN_PIN,     GPIO.OUT, initial=GPIO.LOW)  # LOW = enable
     _pwm = GPIO.PWM(config.ELECTROMAGNET_PIN, 1000)
     _pwm.start(0)
 
@@ -193,18 +192,35 @@ def camera_thread():
         _det   = None
         use_new_api = False
 
+    FRAME_INTERVAL  = 1.0 / 15   # 카메라 최대 15 fps
+    ARUCO_EVERY_N   = 3          # 3프레임마다 ArUco 감지 (CPU 절감)
+    frame_count     = 0
+    last_corners    = None
+    last_ids        = None
+    last_frame_time = 0.0
+
     while True:
+        # FPS 제한
+        now = time.time()
+        elapsed = now - last_frame_time
+        if elapsed < FRAME_INTERVAL:
+            time.sleep(FRAME_INTERVAL - elapsed)
+        last_frame_time = time.time()
+
         frame = cam.capture_array()
         h, w, _ = frame.shape
         cx_img, cy_img = w // 2, h // 2
+        frame_count += 1
 
-        # ArUco 감지
-        gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
-        if use_new_api:
-            corners, ids, _ = _det.detectMarkers(gray)
-        else:
-            corners, ids, _ = aruco.detectMarkers(gray, _dict, parameters=_param)
+        # ArUco 감지: N프레임마다만 실행
+        if frame_count % ARUCO_EVERY_N == 0:
+            gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
+            if use_new_api:
+                last_corners, last_ids, _ = _det.detectMarkers(gray)
+            else:
+                last_corners, last_ids, _ = aruco.detectMarkers(gray, _dict, parameters=_param)
 
+        corners, ids = last_corners, last_ids
         detected = ids is not None and len(ids) > 0
 
         if detected:
@@ -324,15 +340,16 @@ def motor_thread():
 def state_machine_thread():
     """
     50ms 루프로 상태 전이를 관리.
-    각 상태의 진입 조건 타이머는 로컬 변수로 관리.
+    상태 전이는 앞으로만 진행 (역방향 없음).
+    모터는 각 상태 진입 시 한 번만 target 설정 — 이후 motor_thread가 담당.
     """
     global _dock_state
 
     # ── 타이머 변수 ──────────────────────────────────────
-    marker_lost_t     = None  # TARGET_LOCK: 마커 소실 시각
-    dist_300_start    = None  # TARGET_LOCK → SOFT_CAPTURE 타이머
-    dist_15_start     = None  # SOFT_CAPTURE → HARD_LOCK 타이머
-    motor_zero_done_t = None  # HARD_LOCK → DOCKED 타이머
+    marker_detect_start = None  # PRE_DOCKING → TARGET_LOCK 타이머 (3s)
+    dist_300_start      = None  # TARGET_LOCK → SOFT_CAPTURE 타이머
+    dist_lock_start     = None  # SOFT_CAPTURE → HARD_LOCK 타이머
+    motor_zero_done_t   = None  # HARD_LOCK → DOCKED 타이머
 
     def _state(s):
         global _dock_state
@@ -345,60 +362,56 @@ def state_machine_thread():
     while True:
         time.sleep(0.05)  # 50ms 루프
 
-        # 공유 상태 읽기
         with _lock:
-            state   = _dock_state
-            dist    = _distance_mm
-            marker  = _marker_detected
-            steps   = _motor_steps
-            tgt     = _motor_target
+            state  = _dock_state
+            dist   = _distance_mm
+            marker = _marker_detected
+            steps  = _motor_steps
+            tgt    = _motor_target
 
         now = time.time()
 
         # ═══════════════════════════════════════════════
         # State 1: PRE_DOCKING
-        #   - 전자석 OFF, 모터 step 0
-        #   - ArUco 감지 → TARGET_LOCK
+        #   조건: 없음 (평상시)
+        #   행동: 전자석 OFF, 모터 step 0
+        #   전이: ArUco 마커 3s 연속 감지 → TARGET_LOCK
         # ═══════════════════════════════════════════════
         if state == "PRE_DOCKING":
             _set_magnet(False)
             _set_motor_target(0)
-
-            # 타이머 초기화
             dist_300_start    = None
-            dist_15_start     = None
+            dist_lock_start   = None
             motor_zero_done_t = None
-            marker_lost_t     = None
 
             if marker:
-                _state("TARGET_LOCK")
+                if marker_detect_start is None:
+                    marker_detect_start = now
+                    print("\n[SM] 마커 감지 시작, 3s 카운트...")
+                elif now - marker_detect_start >= 3.0:
+                    marker_detect_start = None
+                    _state("TARGET_LOCK")
+            else:
+                if marker_detect_start is not None:
+                    print("\n[SM] 마커 소실 → 타이머 리셋")
+                marker_detect_start = None
 
         # ═══════════════════════════════════════════════
         # State 2: TARGET_LOCK
-        #   - 모터 step 0→3000
-        #   - 마커 소실 1.5s → PRE_DOCKING (전환 전이라면)
-        #   - ToF ≤ 300mm 3s 지속 → SOFT_CAPTURE
+        #   조건: ArUco 마커 3s 연속 감지
+        #   행동: 전자석 OFF, 모터 step 0→3000
+        #   전이: ToF ≤ 300mm 3s 지속 → SOFT_CAPTURE
+        #   ※ 마커 소실돼도 뒤로 돌아가지 않음
         # ═══════════════════════════════════════════════
         elif state == "TARGET_LOCK":
+            # 모터는 진입 시 한 번만 설정 — 이미 3000이면 무시됨
             _set_motor_target(config.MOTOR_TARGET_STEPS)
 
-            # 마커 소실 처리
-            if not marker:
-                if marker_lost_t is None:
-                    marker_lost_t = now
-                elif now - marker_lost_t > config.MARKER_LOST_TIMEOUT_S:
-                    _set_motor_target(0)
-                    dist_300_start = None
-                    _state("PRE_DOCKING")
-                    continue
-            else:
-                marker_lost_t = None   # 마커 재감지 → 타이머 리셋
-
-            # ToF ≤ 300mm 3s 지속 조건
             if dist >= 0 and dist <= config.SOFT_CAPTURE_DIST_MM:
                 if dist_300_start is None:
                     dist_300_start = now
-                    print(f"\n[SM] ToF {int(dist)}mm ≤ 300mm 감지, {config.SOFT_CAPTURE_HOLD_S}s 카운트 시작")
+                    print(f"\n[SM] ToF {int(dist)}mm ≤ {config.SOFT_CAPTURE_DIST_MM}mm 감지, "
+                          f"{config.SOFT_CAPTURE_HOLD_S}s 카운트 시작")
                 elif now - dist_300_start >= config.SOFT_CAPTURE_HOLD_S:
                     dist_300_start = None
                     _set_magnet(True)
@@ -410,34 +423,37 @@ def state_machine_thread():
 
         # ═══════════════════════════════════════════════
         # State 3: SOFT_CAPTURE
-        #   - 전자석 ON, 모터 step 3000 유지
-        #   - ToF ≤ 15mm 5s 지속 → HARD_LOCK
+        #   조건: ToF ≤ 300mm (3s)
+        #   행동: 전자석 ON, 모터 step 3000 유지
+        #   전이: ToF ≤ 50mm 5s 지속 → HARD_LOCK
         # ═══════════════════════════════════════════════
         elif state == "SOFT_CAPTURE":
             _set_magnet(True)
-            _set_motor_target(config.MOTOR_TARGET_STEPS)
+            _set_motor_target(config.MOTOR_TARGET_STEPS)  # 3000 유지
 
             if dist >= 0 and dist <= config.HARD_LOCK_DIST_MM:
-                if dist_15_start is None:
-                    dist_15_start = now
-                    print(f"\n[SM] ToF {int(dist)}mm ≤ 15mm 감지, {config.HARD_LOCK_HOLD_S}s 카운트 시작")
-                elif now - dist_15_start >= config.HARD_LOCK_HOLD_S:
-                    dist_15_start = None
-                    _set_motor_target(0)
+                if dist_lock_start is None:
+                    dist_lock_start = now
+                    print(f"\n[SM] ToF {int(dist)}mm ≤ {config.HARD_LOCK_DIST_MM}mm 감지, "
+                          f"{config.HARD_LOCK_HOLD_S}s 카운트 시작")
+                elif now - dist_lock_start >= config.HARD_LOCK_HOLD_S:
+                    dist_lock_start = None
+                    _set_motor_target(0)  # 모터 복귀 시작
                     _state("HARD_LOCK")
             else:
-                if dist_15_start is not None:
+                if dist_lock_start is not None:
                     print("\n[SM] 거리 초과 → 타이머 리셋")
-                dist_15_start = None
+                dist_lock_start = None
 
         # ═══════════════════════════════════════════════
         # State 4: HARD_LOCK
-        #   - 전자석 ON, 모터 step 3000→0
-        #   - 모터 step 0 도달 후 2s → DOCKED
+        #   조건: ToF ≤ 50mm (5s)
+        #   행동: 전자석 ON, 모터 step 3000→0
+        #   전이: 모터 step 0 도달 후 2s → DOCKED
         # ═══════════════════════════════════════════════
         elif state == "HARD_LOCK":
             _set_magnet(True)
-            _set_motor_target(0)
+            # 모터 target은 SOFT_CAPTURE 전이 시점에 이미 0으로 설정됨
 
             motor_at_zero = (steps == 0 and tgt == 0)
 
@@ -450,12 +466,13 @@ def state_machine_thread():
                     _set_magnet(False)
                     _state("DOCKED")
             else:
-                motor_zero_done_t = None   # 아직 이동 중
+                motor_zero_done_t = None
 
         # ═══════════════════════════════════════════════
         # State 5: DOCKED
-        #   - 전자석 OFF, 모터 step 0 유지
-        #   - 수동 리셋 전까지 유지
+        #   조건: 모터 step 0 도달 후 2s
+        #   행동: 전자석 OFF, 모터 step 0 유지
+        #   전이: 없음 (수동 RESET만 가능)
         # ═══════════════════════════════════════════════
         elif state == "DOCKED":
             _set_magnet(False)
@@ -468,6 +485,7 @@ def state_machine_thread():
 
 def gen_frames():
     """camera_thread가 갱신하는 _last_frame을 JPEG로 인코딩해 스트리밍."""
+    prev_frame = None
     while True:
         with _lock:
             frame = _last_frame
@@ -476,7 +494,13 @@ def gen_frames():
             time.sleep(0.05)
             continue
 
-        _, buf = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
+        # 이전 프레임과 동일하면 스킵 (중복 전송 방지)
+        if frame is prev_frame:
+            time.sleep(0.01)
+            continue
+        prev_frame = frame
+
+        _, buf = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 65])
         yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n'
                + buf.tobytes() + b'\r\n')
 
