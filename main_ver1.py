@@ -1,14 +1,15 @@
 """
 main_ver1.py
 ============
-CubeSat 도킹 모듈 - 2차 시연 메인 스크립트
+CubeSat 도킹·충전 모듈 - 2차 시연 메인 스크립트
 
-5-State Machine:
+6-State Machine:
   State 1  PRE_DOCKING  : 초기 대기 — 전자석 OFF, 모터 step 0
   State 2  TARGET_LOCK  : ArUco 마커 감지 — 모터 step 0→3000
   State 3  SOFT_CAPTURE : ToF ≤ 300mm (3s) — 전자석 ON, 모터 step 3000 유지
   State 4  HARD_LOCK    : ToF ≤ 15mm  (5s) — 전자석 ON,  모터 step 3000→0
   State 5  DOCKED       : 모터 step 0 도달 후 2s — 전자석 OFF, step 0 유지
+  State 6  CHARGING     : DOCKED 후 2s — 전자석 OFF, 모터 step 0 유지, MG992 45°
 
 State 전이:
   PRE_DOCKING  → TARGET_LOCK  : ArUco 마커 감지
@@ -16,6 +17,7 @@ State 전이:
   TARGET_LOCK  → SOFT_CAPTURE : ToF ≤ 300mm 3s 지속
   SOFT_CAPTURE → HARD_LOCK    : ToF ≤ 15mm  5s 지속
   HARD_LOCK    → DOCKED       : 모터 step 0 도달 후 2s
+  DOCKED       → CHARGING     : DOCKED 진입 후 2s (MG992 서보 45° 회전)
 
 실행: python3 main_ver1.py
 접속: http://<pi_ip>:5000
@@ -26,6 +28,22 @@ import math
 import threading
 import config
 from flask import Flask, Response, jsonify
+
+# ── MG992 서보(충전 메커니즘) 설정 ─────────────────────────
+# 도킹 완료 후 충전 단자 연결을 위해 45° 회전하는 서보
+SERVO_CHARGING_PIN   = 19      # GPIO19 (PWM1) — 기존 핀과 충돌 없음
+SERVO_FREQ_HZ        = 50      # 표준 RC 서보 50Hz
+SERVO_CHARGING_ANGLE = 45      # 충전 위치 각도 (deg)
+SERVO_STOWED_ANGLE   = 0       # 대기 위치 각도 (deg)
+CHARGING_WAIT_S      = 2.0     # DOCKED → CHARGING 전이 대기 시간 (s)
+
+
+def _angle_to_duty(angle_deg: float) -> float:
+    """서보 각도(0~180°) → PWM 듀티(%) 변환.
+    0.5ms ~ 2.5ms 펄스 범위, 20ms 주기 기준."""
+    angle = max(0.0, min(180.0, angle_deg))
+    pulse_ms = 0.5 + (2.0 * angle / 180.0)
+    return pulse_ms / 20.0 * 100.0
 
 # ── 하드웨어 임포트 ─────────────────────────────────────
 try:
@@ -64,6 +82,13 @@ if GPIO_OK:
     _pwm = GPIO.PWM(config.ELECTROMAGNET_PIN, 1000)
     _pwm.start(0)
 
+    # MG992 충전 서보 (50Hz PWM)
+    GPIO.setup(SERVO_CHARGING_PIN, GPIO.OUT, initial=GPIO.LOW)
+    _servo_pwm = GPIO.PWM(SERVO_CHARGING_PIN, SERVO_FREQ_HZ)
+    _servo_pwm.start(0)
+else:
+    _servo_pwm = None
+
 # ════════════════════════════════════════════════════════
 # ── 전역 공유 상태 (모든 스레드가 _lock으로 보호) ──────────
 # ════════════════════════════════════════════════════════
@@ -80,6 +105,7 @@ _marker_offset_y = 0.0
 _magnet_on    = False
 _motor_steps  = 0      # 현재 스텝 (motor_thread가 갱신)
 _motor_target = 0      # 목표 스텝 (state_machine이 설정)
+_servo_angle  = 0      # MG992 충전 서보 현재 각도 (deg)
 
 # 상태머신
 _dock_state = "PRE_DOCKING"
@@ -123,6 +149,22 @@ def _set_motor_target(steps: int):
             return
         _motor_target = steps
     print(f"[MOT] 목표 → {steps} steps")
+
+def _set_servo(angle_deg: float):
+    """MG992 서보 회전. 이미 동일 각도면 무시.
+    PWM 신호를 짧게 인가 후 차단해 발열·지터를 방지한다."""
+    global _servo_angle
+    with _lock:
+        if _servo_angle == angle_deg:
+            return
+    if GPIO_OK and _servo_pwm is not None:
+        duty = _angle_to_duty(angle_deg)
+        _servo_pwm.ChangeDutyCycle(duty)
+        time.sleep(0.5)               # 서보 이동 시간 확보
+        _servo_pwm.ChangeDutyCycle(0) # 신호 차단 (발열 방지)
+    with _lock:
+        _servo_angle = angle_deg
+    print(f"[SVO] MG992 → {angle_deg}°")
 
 # ════════════════════════════════════════════════════════
 # ── Thread 1: ToF 센서 ──────────────────────────────────
@@ -273,6 +315,7 @@ def camera_thread():
             "SOFT_CAPTURE": (50,  255, 150),
             "HARD_LOCK":    (50,  150, 255),
             "DOCKED":       (80,  255, 80),
+            "CHARGING":     (255, 200, 50),
         }
         sc = state_colors.get(state, (200, 200, 200))
         cv2.putText(frame, state, (20, 88),
@@ -350,6 +393,7 @@ def state_machine_thread():
     dist_300_start      = None  # TARGET_LOCK → SOFT_CAPTURE 타이머
     dist_lock_start     = None  # SOFT_CAPTURE → HARD_LOCK 타이머
     motor_zero_done_t   = None  # HARD_LOCK → DOCKED 타이머
+    docked_enter_t      = None  # DOCKED → CHARGING 타이머 (2s)
 
     def _state(s):
         global _dock_state
@@ -373,16 +417,15 @@ def state_machine_thread():
 
         # ═══════════════════════════════════════════════
         # State 1: PRE_DOCKING
-        #   조건: 없음 (평상시)
-        #   행동: 전자석 OFF, 모터 step 0
-        #   전이: ArUco 마커 3s 연속 감지 → TARGET_LOCK
         # ═══════════════════════════════════════════════
         if state == "PRE_DOCKING":
             _set_magnet(False)
             _set_motor_target(0)
+            _set_servo(SERVO_STOWED_ANGLE)
             dist_300_start    = None
             dist_lock_start   = None
             motor_zero_done_t = None
+            docked_enter_t    = None
 
             if marker:
                 if marker_detect_start is None:
@@ -398,13 +441,8 @@ def state_machine_thread():
 
         # ═══════════════════════════════════════════════
         # State 2: TARGET_LOCK
-        #   조건: ArUco 마커 3s 연속 감지
-        #   행동: 전자석 OFF, 모터 step 0→3000
-        #   전이: ToF ≤ 300mm 3s 지속 → SOFT_CAPTURE
-        #   ※ 마커 소실돼도 뒤로 돌아가지 않음
         # ═══════════════════════════════════════════════
         elif state == "TARGET_LOCK":
-            # 모터는 진입 시 한 번만 설정 — 이미 3000이면 무시됨
             _set_motor_target(config.MOTOR_TARGET_STEPS)
 
             if dist >= 0 and dist <= config.SOFT_CAPTURE_DIST_MM:
@@ -423,13 +461,10 @@ def state_machine_thread():
 
         # ═══════════════════════════════════════════════
         # State 3: SOFT_CAPTURE
-        #   조건: ToF ≤ 300mm (3s)
-        #   행동: 전자석 ON, 모터 step 3000 유지
-        #   전이: ToF ≤ 50mm 5s 지속 → HARD_LOCK
         # ═══════════════════════════════════════════════
         elif state == "SOFT_CAPTURE":
             _set_magnet(True)
-            _set_motor_target(config.MOTOR_TARGET_STEPS)  # 3000 유지
+            _set_motor_target(config.MOTOR_TARGET_STEPS)
 
             if dist >= 0 and dist <= config.HARD_LOCK_DIST_MM:
                 if dist_lock_start is None:
@@ -438,7 +473,7 @@ def state_machine_thread():
                           f"{config.HARD_LOCK_HOLD_S}s 카운트 시작")
                 elif now - dist_lock_start >= config.HARD_LOCK_HOLD_S:
                     dist_lock_start = None
-                    _set_motor_target(0)  # 모터 복귀 시작
+                    _set_motor_target(0)
                     _state("HARD_LOCK")
             else:
                 if dist_lock_start is not None:
@@ -447,13 +482,9 @@ def state_machine_thread():
 
         # ═══════════════════════════════════════════════
         # State 4: HARD_LOCK
-        #   조건: ToF ≤ 50mm (5s)
-        #   행동: 전자석 ON, 모터 step 3000→0
-        #   전이: 모터 step 0 도달 후 2s → DOCKED
         # ═══════════════════════════════════════════════
         elif state == "HARD_LOCK":
             _set_magnet(True)
-            # 모터 target은 SOFT_CAPTURE 전이 시점에 이미 0으로 설정됨
 
             motor_at_zero = (steps == 0 and tgt == 0)
 
@@ -470,14 +501,26 @@ def state_machine_thread():
 
         # ═══════════════════════════════════════════════
         # State 5: DOCKED
-        #   조건: 모터 step 0 도달 후 2s
-        #   행동: 전자석 OFF, 모터 step 0 유지
-        #   전이: 없음 (수동 RESET만 가능)
         # ═══════════════════════════════════════════════
         elif state == "DOCKED":
             _set_magnet(False)
             _set_motor_target(0)
-            # 종료 상태 — 아무것도 하지 않음
+
+            if docked_enter_t is None:
+                docked_enter_t = now
+                print(f"\n[SM] DOCKED 진입, {CHARGING_WAIT_S}s 후 CHARGING 전이...")
+            elif now - docked_enter_t >= CHARGING_WAIT_S:
+                docked_enter_t = None
+                _set_servo(SERVO_CHARGING_ANGLE)
+                _state("CHARGING")
+
+        # ═══════════════════════════════════════════════
+        # State 6: CHARGING
+        # ═══════════════════════════════════════════════
+        elif state == "CHARGING":
+            _set_magnet(False)
+            _set_motor_target(0)
+            _set_servo(SERVO_CHARGING_ANGLE)
 
 # ════════════════════════════════════════════════════════
 # ── Flask 스트리밍 ──────────────────────────────────────
@@ -494,7 +537,6 @@ def gen_frames():
             time.sleep(0.05)
             continue
 
-        # 이전 프레임과 동일하면 스킵 (중복 전송 방지)
         if frame is prev_frame:
             time.sleep(0.01)
             continue
@@ -514,10 +556,11 @@ def video_feed():
 
 @app.route('/api/reset', methods=['POST'])
 def api_reset():
-    """상태머신을 PRE_DOCKING으로 초기화 (웹 UI 버튼 또는 curl로 호출)."""
+    """상태머신을 PRE_DOCKING으로 초기화."""
     global _dock_state, _motor_target, _magnet_on
     _set_magnet(False)
     _set_motor_target(0)
+    _set_servo(SERVO_STOWED_ANGLE)
     with _lock:
         _dock_state = "PRE_DOCKING"
     print("\n[SM] ★ 수동 리셋 → PRE_DOCKING")
@@ -536,6 +579,7 @@ def api_status():
             "magnet":          _magnet_on,
             "motor_steps":     _motor_steps,
             "motor_target":    _motor_target,
+            "servo_angle":     round(_servo_angle, 1),
             "mission_time":    f"T+ {h:02d}:{m:02d}:{s:02d}",
             "marker_detected": _marker_detected,
             "marker_angle":    round(_marker_angle, 1),
@@ -544,300 +588,1042 @@ def api_status():
         })
 
 # ════════════════════════════════════════════════════════
-# ── HTML 페이지 ─────────────────────────────────────────
+# ── HTML 페이지 (orbital-command UI 스타일) ─────────────
 # ════════════════════════════════════════════════════════
 
 HTML_PAGE = """<!DOCTYPE html>
-<html>
+<html lang="ko">
 <head>
 <meta charset="utf-8">
-<title>CubeSat Docking Control</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>CUBESAT_OS v2.4</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&display=swap" rel="stylesheet">
 <style>
-* { margin:0; padding:0; box-sizing:border-box; }
-body { background:#0a0a0f; color:#e0e0e0; font-family:'Courier New',monospace;
-       height:100vh; display:flex; flex-direction:column; overflow:hidden; }
-
-#topbar { background:#111118; border-bottom:1px solid #1a1a2e; padding:6px 20px;
-          display:flex; justify-content:space-between; align-items:center; }
-#topbar .title { font-size:11px; color:#555; letter-spacing:3px; }
-#topbar .date  { font-size:11px; color:#555; }
-
-#main { flex:1; position:relative; overflow:hidden; display:flex;
-        align-items:center; justify-content:center; }
-#feed { width:100%; height:100%; object-fit:contain; }
-
-/* 공통 오버레이 */
-.overlay { position:absolute; background:rgba(5,5,15,0.88); border:1px solid #1a2a4a;
-           padding:14px 20px; border-radius:6px; backdrop-filter:blur(4px); }
-
-/* 거리 (좌상단) */
-#dist-box { top:20px; left:20px; min-width:190px; }
-#dist-box .lbl { font-size:10px; color:#4a6a9a; letter-spacing:3px; margin-bottom:4px; }
-#dist-box .val { font-size:52px; font-weight:bold; color:#4fc3f7; line-height:1; }
-#dist-box .unt { font-size:12px; color:#4a6a9a; margin-top:2px; }
-#dist-bar-wrap { margin-top:10px; height:4px; background:#1a2a3a; border-radius:2px; }
-#dist-bar { height:100%; width:0%; background:#4fc3f7; border-radius:2px; transition:width 0.4s; }
-
-/* 도킹 상태 (우상단) */
-#status-box { top:20px; right:20px; min-width:200px; text-align:right; border-color:#2a3a1a; }
-#status-box .lbl { font-size:10px; color:#4a7a3a; letter-spacing:3px; margin-bottom:6px; }
-#status-box .val { font-size:20px; font-weight:bold; letter-spacing:2px; }
-#dots { display:flex; gap:7px; margin-top:10px; justify-content:flex-end; }
-.dot { width:11px; height:11px; border-radius:50%; background:#1a2a1a; transition:background 0.3s; }
-.dot.on { background:#69f0ae; }
-
-/* ArUco (좌하단) */
-#aruco-box { bottom:90px; left:20px; min-width:200px; border-color:#2a1a3a; }
-#aruco-box .lbl { font-size:10px; color:#7a4a9a; letter-spacing:3px; margin-bottom:8px; }
-.ar-row { display:flex; justify-content:space-between; align-items:center; margin-bottom:5px; }
-.ar-key { font-size:10px; color:#555; letter-spacing:2px; }
-.ar-val { font-size:17px; font-weight:bold; color:#ce93d8; }
-.ar-val.ok   { color:#69f0ae; }
-.ar-val.warn { color:#ffb74d; }
-#abar-wrap { margin-top:8px; height:4px; background:#1a1a2e; border-radius:2px; position:relative; }
-#abar-zero { position:absolute; left:50%; top:0; height:100%; width:1px; background:#444; }
-#abar      { position:absolute; top:0; height:100%; background:#ce93d8; border-radius:2px; transition:all 0.3s; }
-
-/* 모터 진행 (우하단) */
-#motor-box { bottom:90px; right:20px; min-width:190px; text-align:right; border-color:#1a2a1a; }
-#motor-box .lbl { font-size:10px; color:#3a6a4a; letter-spacing:3px; margin-bottom:6px; }
-#motor-val { font-size:36px; font-weight:bold; color:#69f0ae; }
-#motor-sub { font-size:10px; color:#3a5a3a; margin-top:2px; }
-#motor-bar-wrap { margin-top:10px; height:4px; background:#1a2a1a; border-radius:2px; }
-#motor-bar { height:100%; width:0%; background:#69f0ae; border-radius:2px; transition:width 0.4s; }
-
-/* 하단 바 */
-#bottombar { background:#0d0d18; border-top:1px solid #1a1a2e; display:flex; align-items:stretch; }
-.bsec { padding:12px 22px; display:flex; flex-direction:column; justify-content:center; }
-.bsec + .bsec { border-left:1px solid #1a1a2e; }
-.blabel { font-size:10px; color:#444; letter-spacing:3px; margin-bottom:3px; }
-.bval   { font-size:26px; color:#fff; letter-spacing:2px; }
-
-/* 시퀀스 바 */
-#seq-sec { flex:1; padding:10px 22px; border-left:1px solid #1a1a2e;
-           display:flex; flex-direction:column; justify-content:center; }
-#seq-bar { display:flex; justify-content:space-between; align-items:center;
-           position:relative; margin-top:6px; }
-#seq-line { position:absolute; top:50%; left:0; right:0; height:1px; background:#1a1a2e; }
-.step { display:flex; flex-direction:column; align-items:center; gap:5px; position:relative; z-index:1; }
-.sdot { width:13px; height:13px; border-radius:50%; background:#1a2a1a;
-        border:1px solid #2a3a2a; transition:all 0.3s; }
-.sdot.active { background:#69f0ae; border-color:#69f0ae; }
-.sdot.current { background:#4fc3f7; border-color:#4fc3f7; box-shadow:0 0 6px #4fc3f7; }
-.slbl { font-size:9px; color:#333; letter-spacing:1px; transition:color 0.3s; }
-.slbl.active  { color:#69f0ae; }
-.slbl.current { color:#4fc3f7; }
-
-/* 전자석 */
-#mag-sec { padding:12px 22px; border-left:1px solid #1a1a2e;
-           display:flex; flex-direction:column; justify-content:center; align-items:flex-end; }
-#mag-val { font-size:17px; letter-spacing:3px; transition:color 0.3s; }
-
-#reset-btn {
-  background: transparent; border: 1px solid #c0392b; color: #e74c3c;
-  font-family: 'Courier New', monospace; font-size: 13px; letter-spacing: 2px;
-  padding: 6px 14px; border-radius: 4px; cursor: pointer; transition: all 0.2s;
+/* ── Reset & Base ─────────────────────────────── */
+*, *::before, *::after { margin:0; padding:0; box-sizing:border-box; }
+:root {
+  --bg:     #050505;
+  --bg2:    #0e0e0e;
+  --bg3:    #131313;
+  --bg4:    #1c1b1b;
+  --bd:     #262626;
+  --text:   #e5e2e1;
+  --dim:    #c4c7c8;
+  --muted:  #555;
+  --cyan:   #00eefc;
+  --green:  #00FF55;
+  --amber:  #ffb74d;
+  --red:    #FF0033;
 }
-#reset-btn:hover  { background: #c0392b; color: #fff; }
-#reset-btn:active { background: #922b21; }
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: 'Space Mono', 'Courier New', monospace;
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  -webkit-font-smoothing: antialiased;
+}
+::-webkit-scrollbar { width:4px; height:4px; }
+::-webkit-scrollbar-track { background:#0a0a0a; }
+::-webkit-scrollbar-thumb { background:#262626; }
+::-webkit-scrollbar-thumb:hover { background:#3a3939; }
+
+/* ── TopBar ─────────────────────────────────── */
+#topbar {
+  background: var(--bg3);
+  border-bottom: 1px solid var(--bd);
+  height: 48px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 16px;
+  flex-shrink: 0;
+  user-select: none;
+}
+.sys-name { font-size:15px; font-weight:700; letter-spacing:3px; color:#fff; }
+.status-pill {
+  display: flex; align-items: center; gap: 8px;
+  padding: 3px 12px; border: 1px solid;
+  font-size: 10px; font-weight: 700; letter-spacing: 2px;
+  transition: all 0.4s;
+}
+.status-dot {
+  width: 8px; height: 8px; border-radius: 50%;
+  animation: blink 2s infinite;
+}
+@keyframes blink { 0%,100%{opacity:1} 50%{opacity:0.3} }
+.topbar-right { display:flex; align-items:center; gap:20px; }
+#clock { font-size:10px; color:var(--muted); letter-spacing:1px; }
+
+/* ── Layout ─────────────────────────────────── */
+#body { flex:1; display:flex; overflow:hidden; }
+
+/* ── Sidebar ─────────────────────────────────── */
+#sidebar {
+  background: var(--bg3);
+  border-right: 1px solid var(--bd);
+  width: 240px;
+  display: flex;
+  flex-direction: column;
+  flex-shrink: 0;
+  user-select: none;
+}
+.sb-header { padding:16px; border-bottom:1px solid var(--bd); }
+.sb-mc  { font-size:9px; font-weight:700; letter-spacing:4px; color:var(--dim); margin-bottom:4px; }
+.sb-orbit { font-size:14px; font-weight:700; letter-spacing:2px; color:#fff; }
+#sidebar nav { display:flex; flex-direction:column; margin-top:8px; flex:1; }
+.nav-btn {
+  display:flex; align-items:center; gap:16px;
+  padding:14px 16px;
+  border:none; border-left:2px solid transparent;
+  background:transparent;
+  color:var(--dim); cursor:pointer;
+  font-family:inherit; font-size:10px; font-weight:700; letter-spacing:3px;
+  text-align:left; transition:all 0.15s; width:100%;
+}
+.nav-btn:hover { color:#fff; background:rgba(32,31,31,0.6); }
+.nav-btn.active { color:var(--cyan); border-left-color:var(--cyan); background:rgba(53,53,52,0.3); }
+.nav-btn svg { width:18px; height:18px; flex-shrink:0; }
+.sb-footer { padding:12px; border-top:1px solid var(--bd); text-align:center; }
+.sb-footer span { font-size:8px; letter-spacing:4px; color:#3a3939; }
+
+/* ── Content ─────────────────────────────────── */
+#content { flex:1; overflow-y:auto; display:flex; flex-direction:column; min-width:0; }
+
+/* ── Footer ─────────────────────────────────── */
+#footer {
+  background: var(--bg2);
+  border-top: 1px solid var(--bd);
+  padding: 10px 16px;
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  flex-shrink: 0;
+  user-select: none;
+}
+.f-label { font-size:8px; letter-spacing:4px; color:var(--muted); margin-bottom:3px; }
+.f-val   { font-size:20px; color:#fff; letter-spacing:2px; }
+.seq-wrap { flex:1; }
+.seq-dots { display:flex; align-items:center; justify-content:space-between; position:relative; margin-top:6px; }
+.seq-line-bg { position:absolute; top:50%; left:0; right:0; height:1px; background:var(--bd); }
+.seq-step { display:flex; flex-direction:column; align-items:center; gap:4px; position:relative; z-index:1; }
+.seq-dot {
+  width:12px; height:12px; border-radius:50%;
+  background:#1a2a1a; border:1px solid #2a3a2a;
+  transition:all 0.3s;
+}
+.seq-dot.done    { background:var(--green); border-color:var(--green); }
+.seq-dot.current { background:var(--cyan); border-color:var(--cyan); box-shadow:0 0 6px var(--cyan); }
+.seq-lbl { font-size:8px; letter-spacing:1px; color:#333; transition:color 0.3s; }
+.seq-lbl.done    { color:var(--green); }
+.seq-lbl.current { color:var(--cyan); }
+#reset-btn {
+  padding:8px 16px; border:1px solid #c0392b; color:#e74c3c;
+  background:transparent; cursor:pointer;
+  font-family:inherit; font-size:11px; letter-spacing:2px;
+  transition:all 0.2s; flex-shrink:0;
+}
+#reset-btn:hover  { background:#c0392b; color:#fff; }
+#reset-btn:active { background:#922b21; }
+
+/* ── Panels ─────────────────────────────────── */
+.panel { display:none; flex:1; padding:16px; gap:16px; }
+.panel.active { display:flex; }
+.panel-hdr { border-bottom:1px solid var(--bd); padding-bottom:8px; margin-bottom:4px; }
+.panel-hdr h2 { font-size:11px; font-weight:700; letter-spacing:4px; color:var(--cyan); }
+.panel-hdr p  { font-size:9px; color:var(--dim); margin-top:4px; }
+.tb { border:1px solid var(--bd); }
+
+/* ── VISUALIZER ─────────────────────────────── */
+#tab-visualizer { flex-direction:row; }
+#viz-main { flex:2.2; display:flex; flex-direction:column; gap:12px; min-width:0; }
+#viz-side { width:260px; flex-shrink:0; display:flex; flex-direction:column; gap:12px; }
+
+.viz-hdr {
+  font-size:10px; font-weight:700; letter-spacing:4px; color:var(--dim);
+  display:flex; justify-content:space-between; align-items:center;
+}
+.viz-live {
+  color:var(--cyan); display:flex; align-items:center; gap:6px;
+  font-size:10px; animation:blink 2s infinite;
+}
+.viz-live span { width:6px; height:6px; border-radius:50%; background:var(--cyan); }
+
+/* ── Camera feed area (메인) ─────────────────── */
+#cam-area {
+  flex: 1;
+  position: relative;
+  min-height: 300px;
+  background: #000;
+  overflow: hidden;
+  border: 1px solid var(--bd);
+}
+#viz-feed {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  display: block;
+}
+
+/* ── Mini spacecraft visualizer (우측 하단 오버레이) ── */
+#viz-screen {
+  position: absolute;
+  bottom: 10px;
+  right: 10px;
+  width: 300px;
+  height: 185px;
+  border: 1px solid rgba(0,238,252,0.35);
+  background: rgba(4,4,8,0.90);
+  background-image:
+    linear-gradient(to right, rgba(255,255,255,0.025) 1px, transparent 1px),
+    linear-gradient(to bottom, rgba(255,255,255,0.025) 1px, transparent 1px);
+  background-size: 20px 20px;
+  overflow: hidden;
+  z-index: 5;
+}
+.viz-mini-lbl {
+  position: absolute; top: 5px; left: 7px;
+  font-size: 7px; font-weight: 700; letter-spacing: 2px;
+  color: rgba(0,238,252,0.45); pointer-events: none; z-index: 2; user-select: none;
+}
+.viz-ch-h { position:absolute; top:50%; left:0; right:0; height:1px; background:rgba(142,145,146,0.1); pointer-events:none; }
+.viz-ch-v { position:absolute; left:50%; top:0; bottom:0; width:1px; background:rgba(142,145,146,0.1); pointer-events:none; }
+.viz-ring {
+  position:absolute; border-radius:50%; pointer-events:none;
+  top:50%; left:50%; transform:translate(-50%,-50%);
+}
+
+/* HUD overlays — 카메라 위에 표시 */
+.hud-tl, .hud-tr {
+  position:absolute; top:14px;
+  display:flex; flex-direction:column; gap:4px;
+  pointer-events:none; user-select:none; z-index:8;
+}
+.hud-tl { left:14px; }
+.hud-tr { right:14px; text-align:right; }
+.hud-sub  { font-size:10px; font-weight:700; letter-spacing:4px; color:rgba(160,160,160,0.7);
+            text-shadow: 0 1px 4px rgba(0,0,0,0.9); }
+.hud-main { font-size:24px; font-weight:700; letter-spacing:2px; transition:color 0.3s;
+            text-shadow: 0 2px 8px rgba(0,0,0,0.95); }
+
+/* Laser guide (mini viz 내부) */
+#laser { position:absolute; top:50%; left:18%; right:2%; height:1px; background:rgba(0,238,252,0.18); transform:translateY(-50%); pointer-events:none; }
+
+/* ISS block (mini) */
+#iss {
+  position:absolute; left:4%; top:50%; transform:translateY(-50%);
+  width:56px; height:110px;
+  border:1px solid rgba(142,145,146,0.35);
+  background:rgba(255,255,255,0.01);
+  display:flex; align-items:center; justify-content:flex-end; padding-right:5px;
+}
+.iss-lbl { position:absolute; top:5px; left:5px; font-size:7px; font-weight:700; color:#555; letter-spacing:1px; }
+.iss-port {
+  width:12px; height:28px;
+  background:#121212; border:1px solid #555;
+  position:relative; display:flex; align-items:center; justify-content:center;
+}
+.iss-port::after {
+  content:''; position:absolute; right:-6px;
+  width:6px; height:2px; background:#aaa; transition:background 0.3s;
+}
+.iss-port.docked::after { background:var(--green); }
+
+/* CubeSat block (mini) */
+#cubesat {
+  position:absolute; top:50%; transform:translateY(-50%);
+  width:40px; height:40px;
+  border:1px solid rgba(142,145,146,0.35);
+  background:rgba(255,255,255,0.01);
+  display:flex; align-items:center; justify-content:center;
+  transition:left 0.35s ease-out;
+}
+#cubesat.docked { border-color:rgba(0,240,255,0.5); background:rgba(0,240,255,0.02); }
+#cubesat-lbl { font-size:6px; color:#888; letter-spacing:1px; text-align:center; }
+#cubesat-dist { font-size:7px; color:var(--cyan); margin-top:2px; display:block; }
+
+/* thruster beam (approach indicator) */
+#thruster { position:absolute; right:100%; top:50%; transform:translateY(-50%); margin-right:3px; display:none; }
+#thruster .beam { width:14px; height:3px; background:var(--cyan); animation:blink 0.4s infinite; border-radius:2px; }
+#thruster .tail { width:7px; height:2px; background:rgba(0,238,252,0.5); border-radius:2px; margin-top:1px; }
+
+/* Banner (카메라 위 하단 중앙) */
+.viz-banner {
+  position:absolute; bottom:200px; left:50%; transform:translateX(-50%);
+  padding:8px 20px; border:1px solid; font-size:11px; font-weight:700;
+  letter-spacing:2px; display:none; align-items:center; gap:8px;
+  white-space:nowrap; z-index:10; user-select:none;
+}
+.banner-ok   { background:rgba(0,60,20,0.90); border-color:var(--green); color:var(--green); }
+.banner-warn { background:rgba(100,60,0,0.90); border-color:var(--amber); color:var(--amber); animation:blink 1s infinite; }
+.banner-charge { background:rgba(80,60,0,0.90); border-color:#ffc832; color:#ffc832; }
+
+/* Actuator bar */
+.act-wrap { border:1px solid var(--bd); background:var(--bg4); padding:10px 12px; flex-shrink:0; }
+.act-row { display:flex; justify-content:space-between; align-items:flex-end; margin-bottom:6px; }
+.act-lbl { font-size:9px; font-weight:700; letter-spacing:4px; color:var(--dim); }
+.act-pct { font-size:14px; font-weight:700; color:#fff; letter-spacing:2px; }
+.act-bar-bg {
+  height:20px; background:#131313; border:1px solid var(--bd);
+  position:relative; display:flex; align-items:center;
+}
+.act-bar-fill {
+  height:100%; transition:width 0.3s;
+  background:linear-gradient(to right, rgba(0,238,252,0.35), var(--cyan));
+  position:relative;
+}
+.act-bar-fill::after { content:''; position:absolute; right:0; top:0; bottom:0; width:4px; background:#fff; }
+.act-tick { position:absolute; top:0; bottom:0; width:1px; background:rgba(200,200,200,0.07); }
+.act-tick-lbl { position:absolute; bottom:-1px; transform:translateY(100%); font-size:6px; color:#444; font-weight:700; }
+
+/* Manual control display */
+.mpc-bar { border:1px solid var(--bd); background:var(--bg4); padding:8px 12px; display:flex; justify-content:space-between; align-items:center; flex-shrink:0; }
+.mpc-lbl { font-size:9px; font-weight:700; letter-spacing:3px; color:var(--dim); }
+.mpc-val { font-size:13px; font-weight:700; color:var(--cyan); }
+
+/* ── Telemetry Grid RIGHT ────────────────────── */
+.tg-section { border:1px solid var(--bd); background:var(--bg4); padding:14px; display:flex; flex-direction:column; gap:10px; }
+.tg-hdr { display:flex; justify-content:space-between; align-items:center; border-bottom:1px solid var(--bd); padding-bottom:8px; }
+.tg-title { font-size:10px; font-weight:700; letter-spacing:2px; color:#fff; }
+.badge { font-size:8px; font-weight:700; letter-spacing:2px; padding:2px 6px; border:1px solid; }
+.badge-ok  { color:var(--green); border-color:rgba(0,255,85,0.4); background:rgba(0,255,85,0.08); }
+.badge-warn{ color:var(--amber); border-color:rgba(255,183,77,0.4); background:rgba(255,183,77,0.08); }
+.badge-dim { color:#555; border-color:#333; background:transparent; }
+.step-grid { display:grid; grid-template-columns:1fr 1fr; gap:10px; }
+.step-lbl { font-size:8px; font-weight:700; color:#555; letter-spacing:2px; margin-bottom:4px; }
+.step-val { font-size:26px; font-weight:700; color:#fff; }
+.mdir-bar { border:1px solid var(--bd); background:#131313; padding:8px 10px; display:flex; justify-content:space-between; align-items:center; }
+.mdir-sub { font-size:8px; font-weight:700; color:#555; letter-spacing:2px; }
+.mdir-val { font-size:10px; font-weight:700; letter-spacing:2px; }
+.ar-row { display:flex; justify-content:space-between; align-items:center; margin-bottom:6px; }
+.ar-key { font-size:10px; color:#555; letter-spacing:2px; }
+.ar-val { font-size:16px; font-weight:700; }
+.ar-val.ok   { color:var(--green); }
+.ar-val.warn { color:var(--amber); }
+.ar-val.dim  { color:var(--dim); }
+.abar-bg { height:6px; background:#111; border-radius:3px; position:relative; margin-top:8px; }
+.abar-zero { position:absolute; left:50%; top:0; height:100%; width:1px; background:#444; }
+.abar-fill { position:absolute; top:0; height:100%; border-radius:3px; transition:all 0.3s; }
+.viz-side-hdr { font-size:10px; font-weight:700; letter-spacing:4px; color:var(--dim); }
+.cpu-icon { margin-top:auto; opacity:0.07; display:flex; justify-content:flex-end; }
+
+/* ── TELEMETRY tab ───────────────────────────── */
+#tab-telemetry { flex-direction:column; }
+.tl-grid { display:grid; grid-template-columns:repeat(3,1fr); gap:12px; }
+.tl-card { border:1px solid var(--bd); background:#0f0f0f; padding:14px; }
+.tl-card .tc-l { font-size:8px; font-weight:700; color:#555; letter-spacing:2px; margin-bottom:4px; text-transform:uppercase; }
+.tl-card .tc-v { font-size:22px; font-weight:700; letter-spacing:2px; }
+.tl-card .tc-s { font-size:8px; color:#555; margin-top:6px; }
+.detail-grid { display:grid; grid-template-columns:1fr 1fr; gap:12px; }
+.detail-blk { border:1px solid var(--bd); background:rgba(0,0,0,0.4); padding:16px; }
+.detail-blk h3 { font-size:10px; font-weight:700; letter-spacing:2px; color:#fff; border-bottom:1px solid var(--bd); padding-bottom:6px; margin-bottom:10px; }
+.drow { display:flex; justify-content:space-between; border-bottom:1px solid #0e0e0e; padding:6px 0; font-size:10px; }
+.drow:last-child { border-bottom:none; }
+.dk { color:#555; }
+.dv { font-weight:700; color:#fff; }
+
+/* ── POWER tab ───────────────────────────────── */
+#tab-power { flex-direction:column; }
+.pw-grid { display:grid; grid-template-columns:repeat(2,1fr); gap:12px; }
+.pw-card { border:1px solid var(--bd); background:rgba(0,0,0,0.4); padding:16px; }
+.pw-card h3 { font-size:10px; font-weight:700; letter-spacing:2px; color:#fff; margin-bottom:12px; }
+.mag-big { font-size:48px; font-weight:700; letter-spacing:4px; text-align:center; padding:16px 0; transition:color 0.3s; }
+.servo-display { text-align:center; padding:8px 0; }
+.servo-val { font-size:36px; font-weight:700; color:var(--cyan); }
+.servo-lbl { font-size:10px; color:#555; margin-top:4px; letter-spacing:2px; }
+.sm-grid { display:grid; grid-template-columns:repeat(6,1fr); gap:8px; margin-top:8px; }
+.sm-card {
+  text-align:center; padding:12px 4px;
+  border:1px solid var(--bd); background:#0a0a0a;
+  transition:border-color 0.3s;
+}
+.sm-idx { font-size:8px; color:#555; letter-spacing:1px; margin-bottom:6px; }
+.sm-name { font-size:8px; font-weight:700; letter-spacing:1px; }
+.sm-act { font-size:7px; color:#333; margin-top:6px; line-height:1.5; }
+
+/* ── PAYLOAD tab ─────────────────────────────── */
+#tab-payload { flex-direction:column; }
+#payload-feed { width:100%; max-height:460px; object-fit:contain; border:1px solid var(--bd); display:block; }
+.pl-meta { display:grid; grid-template-columns:repeat(4,1fr); gap:10px; margin-top:12px; }
+.pl-card { border:1px solid var(--bd); background:#0f0f0f; padding:10px; }
+.pl-l { font-size:8px; font-weight:700; color:#555; letter-spacing:2px; margin-bottom:4px; }
+.pl-v { font-size:16px; font-weight:700; }
+
+/* State colors */
+.sc-PRE_DOCKING  { color:#a0a0a0; }
+.sc-TARGET_LOCK  { color:var(--cyan); }
+.sc-SOFT_CAPTURE { color:var(--green); }
+.sc-HARD_LOCK    { color:#ff9800; }
+.sc-DOCKED       { color:var(--green); }
+.sc-CHARGING     { color:#ffc832; }
 </style>
 </head>
 <body>
 
-<div id="topbar">
-  <span class="title">CUBESAT DOCKING CONTROL SYSTEM  v2</span>
-  <span class="date" id="clock"></span>
-</div>
+<!-- ═══ TOP BAR ══════════════════════════════════════════ -->
+<header id="topbar">
+  <div style="display:flex;align-items:center;gap:16px;">
+    <span class="sys-name">CUBESAT_OS_v2.4</span>
+    <div class="status-pill" id="status-pill">
+      <div class="status-dot" id="status-dot" style="background:#555;"></div>
+      <span id="status-text">MISSION_STATUS: STANDBY</span>
+    </div>
+  </div>
+  <div class="topbar-right">
+    <span style="font-size:10px;font-weight:700;letter-spacing:2px;color:#555;">SIMULATION_MODE &nbsp; <span style="color:#333;">OFF</span></span>
+    <span id="clock"></span>
+  </div>
+</header>
 
-<div id="main">
-  <img id="feed" src="/video_feed">
+<!-- ═══ BODY ══════════════════════════════════════════════ -->
+<div id="body">
 
-  <!-- 거리 -->
-  <div class="overlay" id="dist-box">
-    <div class="lbl">TARGET DISTANCE</div>
-    <div class="val" id="dist-val">---</div>
-    <div class="unt">mm</div>
-    <div id="dist-bar-wrap"><div id="dist-bar"></div></div>
+  <!-- Sidebar -->
+  <aside id="sidebar">
+    <div class="sb-header">
+      <div class="sb-mc">MISSION_CONTROL</div>
+      <div class="sb-orbit">CAS500-2_ORBIT</div>
+    </div>
+    <nav>
+      <button class="nav-btn active" data-tab="visualizer" onclick="switchTab('visualizer')">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <circle cx="12" cy="12" r="3"/>
+          <path d="M12 1v4M12 19v4M4.22 4.22l2.83 2.83M16.95 16.95l2.83 2.83M1 12h4M19 12h4M4.22 19.78l2.83-2.83M16.95 7.05l2.83-2.83"/>
+        </svg>
+        VISUALIZER
+      </button>
+      <button class="nav-btn" data-tab="telemetry" onclick="switchTab('telemetry')">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <rect x="5" y="2" width="14" height="20" rx="2"/>
+          <path d="M9 7h6M9 11h6M9 15h4"/>
+        </svg>
+        TELEMETRY
+      </button>
+      <button class="nav-btn" data-tab="power" onclick="switchTab('power')">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/>
+        </svg>
+        POWER
+      </button>
+      <button class="nav-btn" data-tab="payload" onclick="switchTab('payload')">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <rect x="2" y="7" width="20" height="15" rx="2"/>
+          <polyline points="17 2 12 7 7 2"/>
+        </svg>
+        PAYLOAD
+      </button>
+    </nav>
+    <div class="sb-footer"><span>SECURE ENCRYPTED COMM-LINE</span></div>
+  </aside>
+
+  <!-- Content -->
+  <div id="content">
+
+    <!-- ═══ VISUALIZER TAB ═══════════════════════════════ -->
+    <div id="tab-visualizer" class="panel active">
+
+      <!-- Left: Dynamics Visualizer -->
+      <div id="viz-main">
+        <div class="viz-hdr">
+          <span>// DYNAMICS_VISUALIZER</span>
+          <span class="viz-live"><span></span>CAM_FEED_01</span>
+        </div>
+
+        <!-- 카메라 피드 (메인) + 오버레이 -->
+        <div id="cam-area">
+          <!-- 실시간 카메라 스트림 -->
+          <img id="viz-feed" src="/video_feed" alt="Camera Feed">
+
+          <!-- HUD: 거리 (좌상단 카메라 위) -->
+          <div class="hud-tl">
+            <div class="hud-sub">RANGE_TO_TARGET</div>
+            <div class="hud-main" id="hud-dist" style="color:#fff;">DIST: ---</div>
+          </div>
+
+          <!-- HUD: 접근속도 (우상단 카메라 위) -->
+          <div class="hud-tr">
+            <div class="hud-sub">RADIAL_APPROACH_RATE</div>
+            <div class="hud-main" id="hud-rate" style="color:#fff;">RATE: +0.0mm/s</div>
+          </div>
+
+          <!-- 상태 배너 (카메라 위 하단 중앙) -->
+          <div class="viz-banner" id="viz-banner"></div>
+
+          <!-- Mini 궤도 시각화 (우측 하단 오버레이) -->
+          <div id="viz-screen">
+            <div class="viz-mini-lbl">// DYNAMICS_VISUALIZER</div>
+            <div class="viz-ch-h"></div>
+            <div class="viz-ch-v"></div>
+            <div class="viz-ring" style="width:56px;height:56px;border:1px dashed rgba(142,145,146,0.18);"></div>
+            <div class="viz-ring" style="width:120px;height:120px;border:1px solid rgba(142,145,146,0.1);"></div>
+
+            <div id="laser"></div>
+
+            <div id="iss">
+              <div class="iss-lbl">ISS</div>
+              <div class="iss-port" id="iss-port"></div>
+            </div>
+
+            <div id="cubesat" style="left:80%;">
+              <div id="thruster">
+                <div class="beam"></div>
+                <div class="tail"></div>
+              </div>
+              <div id="cubesat-lbl">
+                COS<span id="cubesat-dist">---</span>
+              </div>
+            </div>
+          </div><!-- /viz-screen -->
+
+        </div><!-- /cam-area -->
+
+        <!-- Actuator alignment bar -->
+        <div class="act-wrap">
+          <div class="act-row">
+            <span class="act-lbl">ACTUATOR_ALIGNMENT_POSITION</span>
+            <span class="act-pct" id="act-pct">0.0%</span>
+          </div>
+          <div class="act-bar-bg">
+            <div class="act-bar-fill" id="act-fill" style="width:0%;"></div>
+            <div class="act-tick" style="left:25%;"><span class="act-tick-lbl">25</span></div>
+            <div class="act-tick" style="left:50%;"><span class="act-tick-lbl" style="color:rgba(0,238,252,0.4);">50</span></div>
+            <div class="act-tick" style="left:75%;"><span class="act-tick-lbl">75</span></div>
+          </div>
+        </div>
+
+        <!-- Manual position control (display only) -->
+        <div class="mpc-bar">
+          <span class="mpc-lbl">MANUAL_POSITION_CONTROL</span>
+          <span class="mpc-val" id="mpc-val">+0.00</span>
+        </div>
+      </div><!-- /viz-main -->
+
+      <!-- Right: Telemetry Grid -->
+      <div id="viz-side">
+        <div class="viz-side-hdr">// TELEMETRY_GRID</div>
+
+        <!-- MOTOR_STATS -->
+        <div class="tg-section">
+          <div class="tg-hdr">
+            <span class="tg-title">MOTOR_STATS</span>
+            <span class="badge badge-dim" id="motor-badge">STANDBY</span>
+          </div>
+          <div class="step-grid">
+            <div>
+              <div class="step-lbl">CURRENT_STEP</div>
+              <div class="step-val" id="tg-cur">0</div>
+            </div>
+            <div>
+              <div class="step-lbl">TARGET_STEP</div>
+              <div class="step-val" style="color:#888;" id="tg-tgt">0</div>
+            </div>
+          </div>
+          <div class="mdir-bar">
+            <span class="mdir-sub">MOTOR_STEERING</span>
+            <span class="mdir-val" id="motor-dir" style="color:#555;">&#9632; STANDBY</span>
+          </div>
+        </div>
+
+        <!-- ALIGNMENT_STATUS (ArUco) -->
+        <div class="tg-section">
+          <div class="tg-hdr">
+            <span class="tg-title">ALIGNMENT_STATUS</span>
+            <span class="badge badge-dim" id="aruco-badge">NO LOCK</span>
+          </div>
+          <div class="ar-row">
+            <span class="ar-key">MARKER</span>
+            <span class="ar-val dim" id="tg-marker">NO LOCK</span>
+          </div>
+          <div class="ar-row">
+            <span class="ar-key">ROLL</span>
+            <span class="ar-val dim" id="tg-angle">---</span>
+          </div>
+          <div class="ar-row">
+            <span class="ar-key">dX</span>
+            <span class="ar-val dim" id="tg-dx">---</span>
+          </div>
+          <div class="ar-row">
+            <span class="ar-key">dY</span>
+            <span class="ar-val dim" id="tg-dy">---</span>
+          </div>
+          <div class="abar-bg">
+            <div class="abar-zero"></div>
+            <div class="abar-fill" id="tg-abar" style="left:50%;width:0%;background:var(--green);"></div>
+          </div>
+        </div>
+
+        <!-- Decorative icon -->
+        <div class="cpu-icon">
+          <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.2">
+            <rect x="7" y="7" width="10" height="10" rx="1"/>
+            <path d="M9 7V4M12 7V4M15 7V4M9 17v3M12 17v3M15 17v3M7 9H4M7 12H4M7 15H4M17 9h3M17 12h3M17 15h3"/>
+          </svg>
+        </div>
+      </div><!-- /viz-side -->
+
+    </div><!-- /tab-visualizer -->
+
+    <!-- ═══ TELEMETRY TAB ════════════════════════════════ -->
+    <div id="tab-telemetry" class="panel" style="flex-direction:column;">
+      <div class="panel-hdr">
+        <h2>// SENSOR &amp; STATE TELEMETRY LOGS</h2>
+        <p>Physical telemetry framework &amp; sensor evaluation matrices.</p>
+      </div>
+
+      <div class="tl-grid">
+        <div class="tl-card">
+          <div class="tc-l">RANGE TO TARGET</div>
+          <div class="tc-v" id="tl-dist" style="color:var(--cyan);">--- mm</div>
+          <div class="tc-s">SOFT CAPTURE ≤ 300mm</div>
+        </div>
+        <div class="tl-card">
+          <div class="tc-l">RADIAL APPROACH RATE</div>
+          <div class="tc-v" id="tl-rate" style="color:#f06292;">+0.0 mm/s</div>
+          <div class="tc-s">COMPUTED FROM TOF DELTA</div>
+        </div>
+        <div class="tl-card">
+          <div class="tc-l">STEPPER POSITION</div>
+          <div class="tc-v" id="tl-steps" style="color:#fff;">0 / 0</div>
+          <div class="tc-s">TARGET: 3000 STEPS MAX</div>
+        </div>
+        <div class="tl-card">
+          <div class="tc-l">DOCKING STATE</div>
+          <div class="tc-v sc-PRE_DOCKING" id="tl-state">PRE_DOCKING</div>
+          <div class="tc-s">6-STATE MACHINE</div>
+        </div>
+        <div class="tl-card">
+          <div class="tc-l">MARKER ROLL ANGLE</div>
+          <div class="tc-v" id="tl-angle" style="color:#ce93d8;">--- °</div>
+          <div class="tc-s">OK: |ANGLE| &lt; 5 deg</div>
+        </div>
+        <div class="tl-card">
+          <div class="tc-l">MG992 SERVO ANGLE</div>
+          <div class="tc-v" id="tl-servo" style="color:var(--amber);">0 °</div>
+          <div class="tc-s">CHARGING POSITION: 45 deg</div>
+        </div>
+      </div>
+
+      <div class="detail-grid">
+        <div class="detail-blk">
+          <h3>APPROACH VECTOR CALIBRATOR</h3>
+          <div class="drow"><span class="dk">ARUCO MARKER</span><span class="dv" id="dl-marker">NO LOCK</span></div>
+          <div class="drow"><span class="dk">OFFSET dX</span><span class="dv" id="dl-dx">---</span></div>
+          <div class="drow"><span class="dk">OFFSET dY</span><span class="dv" id="dl-dy">---</span></div>
+          <div class="drow"><span class="dk">MOTOR DIRECTION</span><span class="dv" id="dl-dir">STANDBY</span></div>
+          <div class="drow"><span class="dk">STEP / TARGET</span><span class="dv" id="dl-step">0 / 0</span></div>
+          <div class="drow"><span class="dk">MISSION TIME</span><span class="dv" id="dl-mtime">T+ 00:00:00</span></div>
+        </div>
+        <div class="detail-blk">
+          <h3>// DOCKING SAFETY MATRIX</h3>
+          <div class="drow"><span class="dk">ELECTROMAGNET</span><span class="dv" id="dl-mag" style="color:#555;">OFF</span></div>
+          <div class="drow"><span class="dk">SOFT CAPTURE RANGE</span><span class="dv">≤ 300 mm / 3 s</span></div>
+          <div class="drow"><span class="dk">HARD LOCK RANGE</span><span class="dv">≤ 15 mm / 5 s</span></div>
+          <div class="drow"><span class="dk">MARKER LOCK TIME</span><span class="dv">3 s CONTINUOUS</span></div>
+          <div class="drow"><span class="dk">DOCKED → CHARGING</span><span class="dv">2 s DELAY</span></div>
+          <div style="margin-top:12px;padding:8px;background:rgba(113,88,0,0.1);border:1px solid rgba(255,183,77,0.25);font-size:9px;color:var(--amber);">
+            <strong>CAUTION:</strong> ArUco marker must be visible for 3s continuously before TARGET_LOCK transition activates.
+          </div>
+        </div>
+      </div>
+    </div><!-- /tab-telemetry -->
+
+    <!-- ═══ POWER TAB ════════════════════════════════════ -->
+    <div id="tab-power" class="panel" style="flex-direction:column;">
+      <div class="panel-hdr">
+        <h2>// ONBOARD POWER &amp; ACTUATOR DIAGNOSTICS</h2>
+        <p>Electromagnet, stepper driver, and MG992 charging servo status.</p>
+      </div>
+
+      <div class="pw-grid">
+        <div class="pw-card">
+          <h3>ELECTROMAGNET STATUS</h3>
+          <div class="mag-big" id="mag-big" style="color:#e74c3c;">OFF</div>
+          <div style="font-size:9px;color:#555;letter-spacing:2px;text-align:center;line-height:2;">
+            ON: SOFT_CAPTURE &rarr; HARD_LOCK<br>OFF: ALL OTHER STATES
+          </div>
+        </div>
+        <div class="pw-card">
+          <h3>MG992 CHARGING SERVO</h3>
+          <div class="servo-display">
+            <div class="servo-val" id="servo-big">0 °</div>
+            <div class="servo-lbl">CURRENT ANGLE</div>
+          </div>
+          <div style="margin-top:12px;font-size:9px;color:#555;letter-spacing:2px;text-align:center;">
+            STOWED: 0 deg &nbsp;|&nbsp; CHARGING: 45 deg
+          </div>
+        </div>
+        <div class="pw-card" style="grid-column:span 2;">
+          <h3>STATE MACHINE OVERVIEW</h3>
+          <div class="sm-grid" id="sm-grid">
+            <div class="sm-card" id="sm0">
+              <div class="sm-idx">STATE 1</div>
+              <div class="sm-name sc-PRE_DOCKING">PRE_DOCKING</div>
+              <div class="sm-act">MAG: OFF<br>MOT: 0</div>
+            </div>
+            <div class="sm-card" id="sm1">
+              <div class="sm-idx">STATE 2</div>
+              <div class="sm-name sc-TARGET_LOCK">TARGET_LOCK</div>
+              <div class="sm-act">MAG: OFF<br>MOT: &rarr;3000</div>
+            </div>
+            <div class="sm-card" id="sm2">
+              <div class="sm-idx">STATE 3</div>
+              <div class="sm-name sc-SOFT_CAPTURE">SOFT_CAPTURE</div>
+              <div class="sm-act">MAG: ON<br>MOT: 3000</div>
+            </div>
+            <div class="sm-card" id="sm3">
+              <div class="sm-idx">STATE 4</div>
+              <div class="sm-name sc-HARD_LOCK">HARD_LOCK</div>
+              <div class="sm-act">MAG: ON<br>MOT: &rarr;0</div>
+            </div>
+            <div class="sm-card" id="sm4">
+              <div class="sm-idx">STATE 5</div>
+              <div class="sm-name sc-DOCKED">DOCKED</div>
+              <div class="sm-act">MAG: OFF<br>MOT: 0</div>
+            </div>
+            <div class="sm-card" id="sm5">
+              <div class="sm-idx">STATE 6</div>
+              <div class="sm-name sc-CHARGING">CHARGING</div>
+              <div class="sm-act">MAG: OFF<br>SVO: 45 deg</div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div><!-- /tab-power -->
+
+    <!-- ═══ PAYLOAD TAB ══════════════════════════════════ -->
+    <div id="tab-payload" class="panel" style="flex-direction:column;">
+      <div class="panel-hdr">
+        <h2>// CAMERA FEED &amp; OPTICAL SENSOR</h2>
+        <p>Live camera stream with ArUco marker detection overlay.</p>
+      </div>
+      <img id="payload-feed" src="/video_feed" alt="Camera Feed">
+      <div class="pl-meta">
+        <div class="pl-card"><div class="pl-l">MARKER DETECT</div><div class="pl-v" id="pl-marker" style="color:var(--dim);">NO LOCK</div></div>
+        <div class="pl-card"><div class="pl-l">ROLL ANGLE</div><div class="pl-v" id="pl-angle" style="color:#ce93d8;">---</div></div>
+        <div class="pl-card"><div class="pl-l">OFFSET dX</div><div class="pl-v" id="pl-dx" style="color:var(--dim);">---</div></div>
+        <div class="pl-card"><div class="pl-l">OFFSET dY</div><div class="pl-v" id="pl-dy" style="color:var(--dim);">---</div></div>
+      </div>
+    </div><!-- /tab-payload -->
+
+  </div><!-- /content -->
+</div><!-- /body -->
+
+<!-- ═══ FOOTER ════════════════════════════════════════════ -->
+<footer id="footer">
+  <div>
+    <div class="f-label">MISSION TIME</div>
+    <div class="f-val" id="f-mtime">T+ 00:00:00</div>
   </div>
 
-  <!-- 도킹 상태 -->
-  <div class="overlay" id="status-box">
-    <div class="lbl">DOCKING STATUS</div>
-    <div class="val" id="state-val">PRE_DOCKING</div>
-    <div id="dots">
-      <div class="dot" id="d1"></div>
-      <div class="dot" id="d2"></div>
-      <div class="dot" id="d3"></div>
-      <div class="dot" id="d4"></div>
+  <div class="seq-wrap">
+    <div class="f-label">SEQUENCE</div>
+    <div class="seq-dots">
+      <div class="seq-line-bg"></div>
+      <div class="seq-step"><div class="seq-dot current" id="sd0"></div><span class="seq-lbl current" id="sl0">PRE</span></div>
+      <div class="seq-step"><div class="seq-dot" id="sd1"></div><span class="seq-lbl" id="sl1">T.LOCK</span></div>
+      <div class="seq-step"><div class="seq-dot" id="sd2"></div><span class="seq-lbl" id="sl2">S.CAP</span></div>
+      <div class="seq-step"><div class="seq-dot" id="sd3"></div><span class="seq-lbl" id="sl3">H.LOCK</span></div>
+      <div class="seq-step"><div class="seq-dot" id="sd4"></div><span class="seq-lbl" id="sl4">DOCKED</span></div>
+      <div class="seq-step"><div class="seq-dot" id="sd5"></div><span class="seq-lbl" id="sl5">CHARGING</span></div>
     </div>
   </div>
 
-  <!-- ArUco -->
-  <div class="overlay" id="aruco-box">
-    <div class="lbl">ATTITUDE / ALIGNMENT</div>
-    <div class="ar-row">
-      <span class="ar-key">MARKER</span>
-      <span class="ar-val" id="mk-det">NO LOCK</span>
-    </div>
-    <div class="ar-row">
-      <span class="ar-key">ROLL</span>
-      <span class="ar-val" id="mk-ang">---</span>
-    </div>
-    <div class="ar-row">
-      <span class="ar-key">dX</span>
-      <span class="ar-val" id="mk-dx">---</span>
-    </div>
-    <div class="ar-row">
-      <span class="ar-key">dY</span>
-      <span class="ar-val" id="mk-dy">---</span>
-    </div>
-    <div id="abar-wrap"><div id="abar-zero"></div><div id="abar"></div></div>
-  </div>
-
-  <!-- 모터 -->
-  <div class="overlay" id="motor-box">
-    <div class="lbl">MOTOR POSITION</div>
-    <div id="motor-val">0</div>
-    <div id="motor-sub">/ 3000 steps</div>
-    <div id="motor-bar-wrap"><div id="motor-bar"></div></div>
-  </div>
-</div>
-
-<div id="bottombar">
-  <div class="bsec">
-    <div class="blabel">MISSION TIME</div>
-    <div class="bval" id="mtime">T+ 00:00:00</div>
-  </div>
-
-  <div id="seq-sec">
-    <div class="blabel">SEQUENCE</div>
-    <div id="seq-bar">
-      <div id="seq-line"></div>
-      <div class="step"><div class="sdot" id="st0"></div><span class="slbl" id="sl0">PRE</span></div>
-      <div class="step"><div class="sdot" id="st1"></div><span class="slbl" id="sl1">T.LOCK</span></div>
-      <div class="step"><div class="sdot" id="st2"></div><span class="slbl" id="sl2">S.CAPTURE</span></div>
-      <div class="step"><div class="sdot" id="st3"></div><span class="slbl" id="sl3">H.LOCK</span></div>
-      <div class="step"><div class="sdot" id="st4"></div><span class="slbl" id="sl4">DOCKED</span></div>
-    </div>
-  </div>
-
-  <div id="mag-sec">
-    <div class="blabel">MAGNET</div>
-    <div id="mag-val">OFF</div>
-  </div>
-
-  <div class="bsec" style="border-left:1px solid #1a1a2e;">
-    <div class="blabel">CONTROL</div>
-    <button id="reset-btn" onclick="doReset()">⟳ RESET</button>
-  </div>
-</div>
+  <button id="reset-btn" onclick="doReset()">&#x27F3; RESET</button>
+</footer>
 
 <script>
-const STATES = ["PRE_DOCKING","TARGET_LOCK","SOFT_CAPTURE","HARD_LOCK","DOCKED"];
-const STATE_COLOR = {
-  PRE_DOCKING:  "#a0a0a0",
-  TARGET_LOCK:  "#4fc3f7",
-  SOFT_CAPTURE: "#69f0ae",
-  HARD_LOCK:    "#ff9800",
-  DOCKED:       "#69f0ae",
+// ─────────────────────────────────────────────
+// Constants
+// ─────────────────────────────────────────────
+const STATES = ['PRE_DOCKING','TARGET_LOCK','SOFT_CAPTURE','HARD_LOCK','DOCKED','CHARGING'];
+
+const STATE_COLORS = {
+  PRE_DOCKING:  '#a0a0a0',
+  TARGET_LOCK:  '#00eefc',
+  SOFT_CAPTURE: '#00FF55',
+  HARD_LOCK:    '#ff9800',
+  DOCKED:       '#00FF55',
+  CHARGING:     '#ffc832',
 };
 
+const STATUS_CFG = {
+  PRE_DOCKING:  { dot:'#555',   border:'rgba(100,100,100,0.3)', bg:'rgba(100,100,100,0.08)', label:'MISSION_STATUS: STANDBY' },
+  TARGET_LOCK:  { dot:'#00eefc',border:'rgba(0,238,252,0.3)',   bg:'rgba(0,238,252,0.08)',   label:'MISSION_STATUS: TARGET_LOCKED' },
+  SOFT_CAPTURE: { dot:'#00FF55',border:'rgba(0,255,85,0.3)',    bg:'rgba(0,255,85,0.08)',    label:'STATUS: SOFT_CAPTURE ENGAGED' },
+  HARD_LOCK:    { dot:'#ff9800',border:'rgba(255,152,0,0.3)',   bg:'rgba(255,152,0,0.08)',   label:'STATUS: ALIGNMENT LOCK ALERT' },
+  DOCKED:       { dot:'#00FF55',border:'rgba(0,255,85,0.3)',    bg:'rgba(0,255,85,0.08)',    label:'MISSION_STATUS: DOCKED' },
+  CHARGING:     { dot:'#ffc832',border:'rgba(255,200,50,0.3)',  bg:'rgba(255,200,50,0.08)',  label:'MISSION_STATUS: CHARGING ACTIVE' },
+};
+
+// Distance → left% mapping for CubeSat position
+const DIST_MAX = 500;  // mm — clamp at 500mm for visualization
+const POS_NEAR = 35;   // % — position when distance ≈ 0 (just past ISS)
+const POS_FAR  = 80;   // % — position when distance ≥ 500mm
+
+// ─────────────────────────────────────────────
+// Velocity tracking
+// ─────────────────────────────────────────────
+let prevDist = null;
+let prevTime = null;
+let velocity = 0; // mm/s (negative = approaching)
+
+// ─────────────────────────────────────────────
+// Tab switching
+// ─────────────────────────────────────────────
+function switchTab(tab) {
+  document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
+  document.querySelectorAll('.nav-btn').forEach(b => b.classList.remove('active'));
+  document.getElementById('tab-' + tab).classList.add('active');
+  document.querySelector('.nav-btn[data-tab="' + tab + '"]').classList.add('active');
+}
+
+// ─────────────────────────────────────────────
+// Main update loop (polls /api/status every 500ms)
+// ─────────────────────────────────────────────
 async function update() {
   try {
     const d = await fetch('/api/status').then(r => r.json());
+    const now = Date.now();
 
-    // 미션 시간
-    document.getElementById('mtime').textContent = d.mission_time;
+    // Compute velocity from consecutive distance readings
+    if (prevDist !== null && prevTime !== null) {
+      const dt = (now - prevTime) / 1000;
+      if (dt > 0.05) velocity = (d.distance_mm - prevDist) / dt;
+    }
+    prevDist = d.distance_mm;
+    prevTime = now;
 
-    // 거리
-    const dist = d.distance_mm;
-    document.getElementById('dist-val').textContent = dist >= 0 ? Math.round(dist) : '---';
-    const dpct = dist >= 0 ? Math.min(100, Math.round((1 - dist / 500) * 100)) : 0;
-    document.getElementById('dist-bar').style.width = dpct + '%';
+    const dist   = d.distance_mm;
+    const state  = d.state;
+    const magnet = d.magnet;
+    const steps  = d.motor_steps;
+    const tgt    = d.motor_target;
+    const servo  = d.servo_angle;
+    const mtime  = d.mission_time;
+    const marker = d.marker_detected;
+    const ang    = d.marker_angle;
+    const dx     = d.marker_offset_x;
+    const dy     = d.marker_offset_y;
 
-    // 상태
-    const sv = document.getElementById('state-val');
-    sv.textContent = d.state;
-    sv.style.color = STATE_COLOR[d.state] || '#fff';
+    const isDocked   = (state === 'DOCKED' || state === 'CHARGING');
+    const isCharging = (state === 'CHARGING');
+    const stateIdx   = STATES.indexOf(state);
+    const stateColor = STATE_COLORS[state] || '#a0a0a0';
+    const sc         = STATUS_CFG[state] || STATUS_CFG.PRE_DOCKING;
 
-    const idx = STATES.indexOf(d.state);
-    for (let i = 0; i < 4; i++)
-      document.getElementById('d'+(i+1)).classList.toggle('on', i < idx);
-    for (let i = 0; i < 5; i++) {
-      const dot = document.getElementById('st'+i);
-      const lbl = document.getElementById('sl'+i);
-      dot.className = 'sdot' + (i < idx ? ' active' : i === idx ? ' current' : '');
-      lbl.className = 'slbl' + (i < idx ? ' active' : i === idx ? ' current' : '');
+    // ── TopBar ────────────────────────────────
+    const pill = document.getElementById('status-pill');
+    pill.style.borderColor = sc.border;
+    pill.style.background  = sc.bg;
+    pill.style.color       = sc.dot;
+    document.getElementById('status-dot').style.background = sc.dot;
+    document.getElementById('status-text').textContent = sc.label;
+
+    // ── Mission time ──────────────────────────
+    document.getElementById('f-mtime').textContent  = mtime;
+    document.getElementById('dl-mtime').textContent = mtime;
+
+    // ── CubeSat position ──────────────────────
+    // Map distance 0–500mm → POS_NEAR–POS_FAR %
+    const clampedDist = dist >= 0 ? Math.max(0, Math.min(DIST_MAX, dist)) : DIST_MAX;
+    const leftPct = POS_NEAR + (clampedDist / DIST_MAX) * (POS_FAR - POS_NEAR);
+    document.getElementById('cubesat').style.left = leftPct + '%';
+    document.getElementById('cubesat').classList.toggle('docked', isDocked);
+    document.getElementById('iss-port').classList.toggle('docked', isDocked);
+
+    // CubeSat label
+    const distLbl = dist >= 0 ? (isDocked ? 'LOCK' : Math.round(dist) + 'mm') : '---';
+    document.getElementById('cubesat-dist').textContent = distLbl;
+
+    // Thruster beam (show when approaching: velocity < -2mm/s)
+    document.getElementById('thruster').style.display = (velocity < -2 && !isDocked) ? 'block' : 'none';
+
+    // ── HUD Overlays ──────────────────────────
+    const hudDist = document.getElementById('hud-dist');
+    hudDist.textContent = 'DIST: ' + (dist >= 0 ? Math.round(dist) + 'mm' : '---');
+    hudDist.style.color = isDocked ? '#00eefc' : '#fff';
+
+    const rateStr = (velocity >= 0 ? '+' : '') + velocity.toFixed(1) + 'mm/s';
+    const hudRate = document.getElementById('hud-rate');
+    hudRate.textContent = 'RATE: ' + rateStr;
+    const isHighSpeed = (dist >= 0 && dist < 150 && velocity < -20);
+    hudRate.style.color = isHighSpeed ? '#f44336' : (Math.abs(velocity) > 2 ? '#f06292' : '#fff');
+
+    // ── Banner ────────────────────────────────
+    const banner = document.getElementById('viz-banner');
+    if (isCharging) {
+      banner.className = 'viz-banner banner-charge';
+      banner.textContent = '&#x26A1; CHARGING MECHANISM ACTIVE';
+      banner.style.display = 'flex';
+    } else if (isDocked) {
+      banner.className = 'viz-banner banner-ok';
+      banner.textContent = '&#x2713; DOCKING MECHANISM LOCK SECURED';
+      banner.style.display = 'flex';
+    } else if (isHighSpeed) {
+      banner.className = 'viz-banner banner-warn';
+      banner.textContent = '&#x26A0; APPROACH VELOCITY WARNING';
+      banner.style.display = 'flex';
+    } else {
+      banner.style.display = 'none';
     }
 
-    // 전자석
-    const mv = document.getElementById('mag-val');
-    mv.textContent = d.magnet ? 'ON' : 'OFF';
-    mv.style.color = d.magnet ? '#69f0ae' : '#e74c3c';
+    // ── Actuator bar (motor_steps / 3000) ─────
+    const maxSteps = tgt > 0 ? tgt : 3000;
+    const actPct = Math.min(100, steps / maxSteps * 100);
+    document.getElementById('act-pct').textContent = actPct.toFixed(1) + '%';
+    document.getElementById('act-fill').style.width = actPct + '%';
 
-    // 모터
-    const steps = d.motor_steps;
-    document.getElementById('motor-val').textContent = steps;
-    const mpct = Math.min(100, Math.round(steps / 3000 * 100));
-    document.getElementById('motor-bar').style.width = mpct + '%';
-    const motorColor = steps >= 3000 ? '#69f0ae' : steps > 0 ? '#4fc3f7' : '#3a5a3a';
-    document.getElementById('motor-bar').style.background = motorColor;
-    document.getElementById('motor-val').style.color = motorColor;
+    // Manual control display (velocity-based)
+    document.getElementById('mpc-val').textContent = (velocity >= 0 ? '+' : '') + (velocity / 100).toFixed(2);
 
-    // ArUco
-    const mkDet = document.getElementById('mk-det');
-    const mkAng = document.getElementById('mk-ang');
-    const mkDx  = document.getElementById('mk-dx');
-    const mkDy  = document.getElementById('mk-dy');
-    const abar  = document.getElementById('abar');
+    // ── Telemetry Grid: Motor ─────────────────
+    document.getElementById('tg-cur').textContent = steps;
+    document.getElementById('tg-tgt').textContent = tgt;
 
-    if (d.marker_detected) {
-      const ang = d.marker_angle;
-      mkDet.textContent = 'LOCKED';   mkDet.className = 'ar-val ok';
+    const motorBadge = document.getElementById('motor-badge');
+    if (state === 'TARGET_LOCK' || state === 'SOFT_CAPTURE' || state === 'HARD_LOCK') {
+      motorBadge.className = 'badge badge-ok';
+      motorBadge.textContent = 'ACTIVE';
+    } else {
+      motorBadge.className = 'badge badge-dim';
+      motorBadge.textContent = 'STANDBY';
+    }
+
+    let dirTxt = '&#9632; STANDBY';
+    let dirColor = '#555';
+    if (steps < tgt) { dirTxt = '&rarr; FORWARD'; dirColor = '#00eefc'; }
+    else if (steps > tgt) { dirTxt = '&larr; REVERSE'; dirColor = '#00eefc'; }
+    const mdir = document.getElementById('motor-dir');
+    mdir.innerHTML = dirTxt;
+    mdir.style.color = dirColor;
+
+    // ── Telemetry Grid: ArUco ─────────────────
+    const arucoBadge = document.getElementById('aruco-badge');
+    const tgMarker = document.getElementById('tg-marker');
+    const tgAngle  = document.getElementById('tg-angle');
+    const tgDx     = document.getElementById('tg-dx');
+    const tgDy     = document.getElementById('tg-dy');
+    const abar     = document.getElementById('tg-abar');
+
+    if (marker) {
+      arucoBadge.className = 'badge badge-ok';
+      arucoBadge.textContent = 'LOCKED';
+      tgMarker.textContent = 'LOCKED'; tgMarker.className = 'ar-val ok';
       const angOk = Math.abs(ang) < 5;
-      mkAng.textContent = (ang >= 0 ? '+' : '') + ang.toFixed(1) + '°';
-      mkAng.className   = 'ar-val ' + (angOk ? 'ok' : 'warn');
-      const dxOk = Math.abs(d.marker_offset_x) < 20;
-      const dyOk = Math.abs(d.marker_offset_y) < 20;
-      mkDx.textContent = (d.marker_offset_x >= 0 ? '+' : '') + d.marker_offset_x.toFixed(0) + ' px';
-      mkDx.className   = 'ar-val ' + (dxOk ? 'ok' : 'warn');
-      mkDy.textContent = (d.marker_offset_y >= 0 ? '+' : '') + d.marker_offset_y.toFixed(0) + ' px';
-      mkDy.className   = 'ar-val ' + (dyOk ? 'ok' : 'warn');
+      const dxOk  = Math.abs(dx)  < 20;
+      const dyOk  = Math.abs(dy)  < 20;
+      tgAngle.textContent = (ang >= 0 ? '+' : '') + ang.toFixed(1) + 'deg';
+      tgAngle.className   = 'ar-val ' + (angOk ? 'ok' : 'warn');
+      tgDx.textContent    = (dx  >= 0 ? '+' : '') + dx.toFixed(0) + 'px';
+      tgDx.className      = 'ar-val ' + (dxOk ? 'ok' : 'warn');
+      tgDy.textContent    = (dy  >= 0 ? '+' : '') + dy.toFixed(0) + 'px';
+      tgDy.className      = 'ar-val ' + (dyOk ? 'ok' : 'warn');
       const clamp = Math.max(-45, Math.min(45, ang));
       const bp    = (clamp + 45) / 90 * 100;
       abar.style.left       = Math.min(50, bp) + '%';
       abar.style.width      = Math.abs(bp - 50) + '%';
-      abar.style.background = angOk ? '#69f0ae' : '#ffb74d';
+      abar.style.background = angOk ? 'var(--green)' : 'var(--amber)';
     } else {
-      mkDet.textContent = 'NO LOCK'; mkDet.className = 'ar-val';
-      mkAng.textContent = '---';     mkAng.className = 'ar-val';
-      mkDx.textContent  = '---';     mkDx.className  = 'ar-val';
-      mkDy.textContent  = '---';     mkDy.className  = 'ar-val';
+      arucoBadge.className = 'badge badge-dim';
+      arucoBadge.textContent = 'NO LOCK';
+      ['tg-marker','tg-angle','tg-dx','tg-dy'].forEach(id => {
+        const el = document.getElementById(id);
+        el.textContent = id === 'tg-marker' ? 'NO LOCK' : '---';
+        el.className = 'ar-val dim';
+      });
       abar.style.width = '0%';
     }
-  } catch(e) {}
+
+    // ── Sequence Dots ─────────────────────────
+    for (let i = 0; i < 6; i++) {
+      const dot = document.getElementById('sd' + i);
+      const lbl = document.getElementById('sl' + i);
+      dot.className = 'seq-dot' + (i < stateIdx ? ' done' : i === stateIdx ? ' current' : '');
+      lbl.className = 'seq-lbl' + (i < stateIdx ? ' done' : i === stateIdx ? ' current' : '');
+    }
+
+    // ── Telemetry Tab ─────────────────────────
+    const tlDist = document.getElementById('tl-dist');
+    tlDist.textContent = dist >= 0 ? Math.round(dist) + ' mm' : '--- mm';
+    tlDist.style.color = (dist >= 0 && dist <= 300) ? 'var(--amber)' : 'var(--cyan)';
+
+    document.getElementById('tl-rate').textContent = rateStr;
+    document.getElementById('tl-steps').textContent = steps + ' / ' + tgt;
+
+    const tlState = document.getElementById('tl-state');
+    tlState.textContent = state;
+    tlState.style.color = stateColor;
+
+    document.getElementById('tl-angle').textContent = marker ? (ang >= 0 ? '+' : '') + ang.toFixed(1) + ' deg' : '--- deg';
+    document.getElementById('tl-servo').textContent = servo + ' deg';
+
+    document.getElementById('dl-marker').textContent = marker ? 'LOCKED' : 'NO LOCK';
+    document.getElementById('dl-marker').style.color = marker ? 'var(--green)' : '#555';
+    document.getElementById('dl-dx').textContent = marker ? (dx  >= 0 ? '+' : '') + dx.toFixed(0) + 'px' : '---';
+    document.getElementById('dl-dy').textContent = marker ? (dy  >= 0 ? '+' : '') + dy.toFixed(0) + 'px' : '---';
+    document.getElementById('dl-dir').innerHTML = dirTxt;
+    document.getElementById('dl-step').textContent = steps + ' / ' + tgt;
+
+    const dlMag = document.getElementById('dl-mag');
+    dlMag.textContent = magnet ? 'ON' : 'OFF';
+    dlMag.style.color = magnet ? 'var(--green)' : '#555';
+
+    // ── Power Tab ─────────────────────────────
+    const magBig = document.getElementById('mag-big');
+    magBig.textContent = magnet ? 'ON' : 'OFF';
+    magBig.style.color = magnet ? 'var(--green)' : '#e74c3c';
+    document.getElementById('servo-big').textContent = servo + ' deg';
+
+    // Highlight active state card in SM overview
+    for (let i = 0; i < 6; i++) {
+      const card = document.getElementById('sm' + i);
+      card.style.borderColor = (i === stateIdx) ? stateColor : 'var(--bd)';
+      card.style.background  = (i === stateIdx) ? 'rgba(255,255,255,0.04)' : '#0a0a0a';
+    }
+
+    // ── Payload Tab ───────────────────────────
+    const plMarker = document.getElementById('pl-marker');
+    plMarker.textContent = marker ? 'LOCKED' : 'NO LOCK';
+    plMarker.style.color = marker ? 'var(--green)' : 'var(--dim)';
+    document.getElementById('pl-angle').textContent = marker ? (ang >= 0 ? '+' : '') + ang.toFixed(1) + ' deg' : '---';
+    document.getElementById('pl-dx').textContent    = marker ? (dx  >= 0 ? '+' : '') + dx.toFixed(0) + 'px' : '---';
+    document.getElementById('pl-dy').textContent    = marker ? (dy  >= 0 ? '+' : '') + dy.toFixed(0) + 'px' : '---';
+
+  } catch(e) {
+    console.warn('[UI] status fetch failed:', e);
+  }
 }
 
+// ─────────────────────────────────────────────
+// Reset button
+// ─────────────────────────────────────────────
 async function doReset() {
   const btn = document.getElementById('reset-btn');
   btn.textContent = '...';
   btn.disabled = true;
   try {
     await fetch('/api/reset', { method: 'POST' });
+    prevDist = null; prevTime = null; velocity = 0;
     await update();
   } catch(e) {}
-  setTimeout(() => { btn.textContent = '⟳ RESET'; btn.disabled = false; }, 800);
+  setTimeout(() => { btn.textContent = '&#x27F3; RESET'; btn.disabled = false; }, 900);
 }
 
-setInterval(update, 500);
+// ─────────────────────────────────────────────
+// Clock & polling
+// ─────────────────────────────────────────────
 setInterval(() => {
   document.getElementById('clock').textContent = new Date().toLocaleString('ko-KR');
 }, 1000);
+
+setInterval(update, 500);
 update();
 </script>
 </body>
-</html>
-"""
+</html>"""
 
 # ════════════════════════════════════════════════════════
 # ── 메인 실행 ───────────────────────────────────────────
@@ -849,7 +1635,8 @@ if __name__ == '__main__':
     threading.Thread(target=state_machine_thread, daemon=True, name="StateMachine").start()
 
     print("=" * 52)
-    print("  CubeSat Docking System  |  main_ver1.py")
+    print("  CubeSat Docking + Charging System  |  main_ver1.py")
+    print("  6-State: PRE → T.LOCK → S.CAP → H.LOCK → DOCKED → CHARGING")
     print(f"  웹 UI : http://pi.local:5000")
     print("=" * 52)
 
@@ -858,7 +1645,10 @@ if __name__ == '__main__':
     finally:
         _set_magnet(False)
         _set_motor_target(0)
+        _set_servo(SERVO_STOWED_ANGLE)
         if GPIO_OK:
             _pwm.stop()
+            if _servo_pwm is not None:
+                _servo_pwm.stop()
             GPIO.cleanup()
         print("\n[SYS] 종료 완료")
