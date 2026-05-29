@@ -82,6 +82,9 @@ if GPIO_OK:
     _pwm = GPIO.PWM(config.ELECTROMAGNET_PIN, 1000)
     _pwm.start(0)
 
+    # DFR0438 LED — 항상 ON
+    GPIO.setup(config.LED_PIN, GPIO.OUT, initial=GPIO.HIGH)
+
     # MG992 충전 서보 (50Hz PWM)
     GPIO.setup(SERVO_CHARGING_PIN, GPIO.OUT, initial=GPIO.LOW)
     _servo_pwm = GPIO.PWM(SERVO_CHARGING_PIN, SERVO_FREQ_HZ)
@@ -300,15 +303,7 @@ def camera_thread():
             steps = _motor_steps
             tgt   = _motor_target
 
-        # 거리 오버레이
-        dist_text  = f"{int(dist)} mm" if dist >= 0 else "N/A"
-        dist_color = ((100, 220, 100) if dist > 300 else
-                      (50,  200, 255) if dist > 15  else
-                      (50,  80,  255)) if dist >= 0 else (120, 120, 120)
-        cv2.putText(frame, dist_text, (20, 48),
-                    cv2.FONT_HERSHEY_SIMPLEX, 1.4, dist_color, 2)
-
-        # 상태 오버레이
+        # ── 카메라 오버레이 (최소화) ─────────────────
         state_colors = {
             "PRE_DOCKING":  (160, 160, 160),
             "TARGET_LOCK":  (100, 220, 255),
@@ -318,15 +313,9 @@ def camera_thread():
             "CHARGING":     (255, 200, 50),
         }
         sc = state_colors.get(state, (200, 200, 200))
-        cv2.putText(frame, state, (20, 88),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.75, sc, 2)
-
-        # 전자석 + 모터 오버레이
-        mag_c = (50, 255, 100) if mag else (100, 100, 200)
-        cv2.putText(frame, "MAG: ON " if mag else "MAG: OFF",
-                    (20, 122), cv2.FONT_HERSHEY_SIMPLEX, 0.6, mag_c, 2)
-        cv2.putText(frame, f"STEP: {steps}/{tgt}",
-                    (20, 152), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (180, 180, 180), 1)
+        # 상태 이름만 우하단에 작게 표시 (HTML HUD와 중복 방지)
+        cv2.putText(frame, state, (w - 220, h - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.40, sc, 1)
 
         # 크로스헤어
         ch_c = (50, 255, 100) if detected else (130, 130, 130)
@@ -796,18 +785,41 @@ body {
   top:50%; left:50%; transform:translate(-50%,-50%);
 }
 
-/* HUD overlays — 카메라 위에 표시 */
-.hud-tl, .hud-tr {
-  position:absolute; top:14px;
-  display:flex; flex-direction:column; gap:4px;
-  pointer-events:none; user-select:none; z-index:8;
+/* HUD 코너 패널 — 카메라 위 오버레이 */
+.hud-panel {
+  position: absolute;
+  background: rgba(0,0,0,0.58);
+  border: 1px solid rgba(255,255,255,0.1);
+  padding: 6px 10px;
+  pointer-events: none;
+  user-select: none;
+  z-index: 8;
+  backdrop-filter: blur(2px);
 }
-.hud-tl { left:14px; }
-.hud-tr { right:14px; text-align:right; }
-.hud-sub  { font-size:10px; font-weight:700; letter-spacing:4px; color:rgba(160,160,160,0.7);
-            text-shadow: 0 1px 4px rgba(0,0,0,0.9); }
-.hud-main { font-size:24px; font-weight:700; letter-spacing:2px; transition:color 0.3s;
-            text-shadow: 0 2px 8px rgba(0,0,0,0.95); }
+.hud-panel .hp-lbl {
+  font-size: 8px;
+  font-weight: 700;
+  letter-spacing: 3px;
+  color: rgba(0,238,252,0.55);
+  margin-bottom: 3px;
+}
+.hud-panel .hp-val {
+  font-size: 18px;
+  font-weight: 700;
+  letter-spacing: 1px;
+  color: #fff;
+  transition: color 0.3s;
+}
+.hud-tl { top: 12px; left: 12px; }
+.hud-tr { top: 12px; right: 12px; text-align: right; }
+.hud-bl { bottom: 12px; left: 12px; }
+.hud-bc {
+  bottom: 12px;
+  left: 50%;
+  transform: translateX(-50%);
+  text-align: center;
+  white-space: nowrap;
+}
 
 /* Laser guide (mini viz 내부) */
 #laser { position:absolute; top:50%; left:18%; right:2%; height:1px; background:rgba(0,238,252,0.18); transform:translateY(-50%); pointer-events:none; }
@@ -1037,16 +1049,28 @@ body {
           <!-- 실시간 카메라 스트림 -->
           <img id="viz-feed" src="/video_feed" alt="Camera Feed">
 
-          <!-- HUD: 거리 (좌상단 카메라 위) -->
-          <div class="hud-tl">
-            <div class="hud-sub">RANGE_TO_TARGET</div>
-            <div class="hud-main" id="hud-dist" style="color:#fff;">DIST: ---</div>
+          <!-- HUD: 거리 (좌상단) -->
+          <div class="hud-panel hud-tl">
+            <div class="hp-lbl">DIST</div>
+            <div class="hp-val" id="hud-dist">--- mm</div>
           </div>
 
-          <!-- HUD: 접근속도 (우상단 카메라 위) -->
-          <div class="hud-tr">
-            <div class="hud-sub">RADIAL_APPROACH_RATE</div>
-            <div class="hud-main" id="hud-rate" style="color:#fff;">RATE: +0.0mm/s</div>
+          <!-- HUD: 접근속도 (우상단) -->
+          <div class="hud-panel hud-tr">
+            <div class="hp-lbl">RATE</div>
+            <div class="hp-val" id="hud-rate">+0.0 mm/s</div>
+          </div>
+
+          <!-- HUD: 현재 상태 (좌하단) -->
+          <div class="hud-panel hud-bl">
+            <div class="hp-lbl">STATE</div>
+            <div class="hp-val" id="hud-state" style="font-size:13px;letter-spacing:2px;">PRE_DOCKING</div>
+          </div>
+
+          <!-- HUD: 미션 시간 (하단 중앙) -->
+          <div class="hud-panel hud-bc">
+            <div class="hp-lbl">MISSION_ELAPSED_TIME</div>
+            <div class="hp-val" id="hud-mtime" style="font-size:14px;text-align:center;">T+ 00:00:00</div>
           </div>
 
           <!-- 상태 배너 (카메라 위 하단 중앙) -->
@@ -1441,16 +1465,27 @@ async function update() {
     // Thruster beam (show when approaching: velocity < -2mm/s)
     document.getElementById('thruster').style.display = (velocity < -2 && !isDocked) ? 'block' : 'none';
 
-    // ── HUD Overlays ──────────────────────────
-    const hudDist = document.getElementById('hud-dist');
-    hudDist.textContent = 'DIST: ' + (dist >= 0 ? Math.round(dist) + 'mm' : '---');
-    hudDist.style.color = isDocked ? '#00eefc' : '#fff';
-
-    const rateStr = (velocity >= 0 ? '+' : '') + velocity.toFixed(1) + 'mm/s';
-    const hudRate = document.getElementById('hud-rate');
-    hudRate.textContent = 'RATE: ' + rateStr;
+    // ── HUD 코너 패널 업데이트 ────────────────
     const isHighSpeed = (dist >= 0 && dist < 150 && velocity < -20);
-    hudRate.style.color = isHighSpeed ? '#f44336' : (Math.abs(velocity) > 2 ? '#f06292' : '#fff');
+    const rateStr = (velocity >= 0 ? '+' : '') + velocity.toFixed(1) + ' mm/s';
+
+    // DIST
+    const hudDist = document.getElementById('hud-dist');
+    hudDist.textContent = dist >= 0 ? Math.round(dist) + ' mm' : '--- mm';
+    hudDist.style.color = isDocked ? '#00eefc' : dist >= 0 && dist <= 300 ? '#ffb74d' : '#fff';
+
+    // RATE
+    const hudRate = document.getElementById('hud-rate');
+    hudRate.textContent = rateStr;
+    hudRate.style.color = isHighSpeed ? '#f44336' : Math.abs(velocity) > 5 ? '#f06292' : '#fff';
+
+    // STATE
+    const hudState = document.getElementById('hud-state');
+    hudState.textContent = state;
+    hudState.style.color = stateColor;
+
+    // MISSION TIME
+    document.getElementById('hud-mtime').textContent = mtime;
 
     // ── Banner ────────────────────────────────
     const banner = document.getElementById('viz-banner');

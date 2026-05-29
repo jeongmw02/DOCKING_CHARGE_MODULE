@@ -4,7 +4,7 @@ import time
 DIR_PIN = 17
 STEP_PIN = 12
 
-STEPS = 8000
+STEPS = 30000
 MIN_DELAY = 0.001
 MAX_DELAY = 0.004
 ACCEL_STEPS = 300
@@ -39,12 +39,12 @@ try:
     print("테스트 시작")
     
     print("앞으로 이동 중...")
-    move_motor(GPIO.HIGH, STEPS, MIN_DELAY, MAX_DELAY, ACCEL_STEPS)
+    move_motor(GPIO.LOW, STEPS, MIN_DELAY, MAX_DELAY, ACCEL_STEPS)
     
     time.sleep(1)
     
     print("뒤로 이동 중...")
-    move_motor(GPIO.LOW, STEPS, MIN_DELAY, MAX_DELAY, ACCEL_STEPS)
+    move_motor(GPIO.HIGH, STEPS, MIN_DELAY, MAX_DELAY, ACCEL_STEPS)
 
 except KeyboardInterrupt:
     print("\n중단됨")

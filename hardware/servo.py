@@ -22,16 +22,22 @@ class ServoMotor:
         self._angle = None
 
     def setup(self):
-        # TODO: GPIO.setup(pin, OUT)
-        # TODO: GPIO.PWM(pin, SERVO_FREQ_HZ).start(0)
+        import RPi.GPIO as GPIO
+        GPIO.setmode(GPIO.BCM)
+        GPIO.setwarnings(False)
+        GPIO.setup(self._pin, GPIO.OUT)
+        self._pwm = GPIO.PWM(self._pin, config.SERVO_FREQ_HZ)
+        self._pwm.start(0)
         log.info(f"[{self._name}] 서보 초기화 (GPIO{self._pin})")
 
     def move_to(self, angle_deg: float, delay_s: float = 0.5):
         """목표 각도로 이동 후 신호 차단 (발열 방지)."""
-        # TODO: duty = _angle_to_duty(angle_deg)
-        # TODO: pwm.ChangeDutyCycle(duty) → sleep(delay_s) → duty(0)
+        duty = self._angle_to_duty(angle_deg)
+        self._pwm.ChangeDutyCycle(duty)
+        time.sleep(delay_s)
+        self._pwm.ChangeDutyCycle(0)
         self._angle = angle_deg
-        log.info(f"[{self._name}] → {angle_deg}°")
+        log.info(f"[{self._name}] → {angle_deg}° (duty={duty:.2f}%)")
 
     def deploy(self):
         self.move_to(config.SOLAR_PANEL_DEPLOYED_DEG)
@@ -44,12 +50,21 @@ class ServoMotor:
         return self._angle
 
     def cleanup(self):
-        # TODO: pwm.stop()
+        if self._pwm:
+            self._pwm.stop()
+        import RPi.GPIO as GPIO
+        GPIO.cleanup(self._pin)
         log.info(f"[{self._name}] 서보 정리 완료")
 
     def _angle_to_duty(self, angle_deg: float) -> float:
-        # TODO: 공식 적용 → duty 반환
-        return 0.0
+        """angle_deg (0~180) → PWM duty cycle (%)
+        duty = ((min_ms + (max_ms - min_ms) * angle/180) / 20ms) * 100
+        MG92B: 0.5ms ~ 2.5ms pulse width
+        """
+        angle_deg = max(0.0, min(180.0, angle_deg))
+        pulse_ms = config.SERVO_MIN_PULSE_MS + (config.SERVO_MAX_PULSE_MS - config.SERVO_MIN_PULSE_MS) * angle_deg / 180.0
+        duty = (pulse_ms / 20.0) * 100.0
+        return duty
 
 
 class SolarPanelArray:
