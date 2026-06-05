@@ -5,15 +5,18 @@ import config
 from constants import *
 import shared
 
-def _angle_to_duty(angle_deg: float) -> float:
-    """서보 각도(0~180°) → PWM 듀티(%) 변환.
-    0.5ms ~ 2.5ms 펄스 범위, 20ms 주기 기준."""
-    angle = max(0.0, min(180.0, angle_deg))
-    pulse_ms = 0.5 + (2.0 * angle / 180.0)
-    return pulse_ms / 20.0 * 100.0
+# ── pigpio (스테퍼 + 서보 정밀 제어) ─────────────────────────
+_pi = None
+try:
+    import pigpio
+    _pi = pigpio.pi()
+    if not _pi.connected:
+        print("[WARN] pigpiod 데몬 미실행 → sudo pigpiod 실행 필요")
+        _pi = None
+except ImportError:
+    print("[WARN] pigpio 없음 → 시뮬레이션 모드")
 
-
-# ── 하드웨어 임포트 ─────────────────────────────────────
+# ── RPi.GPIO (전자석 PWM용) ───────────────────────────────────
 try:
     import RPi.GPIO as GPIO
     GPIO_OK = True
@@ -25,7 +28,6 @@ import cv2
 import cv2.aruco as aruco
 
 def _open_usb_camera():
-    """V4L2 인덱스 0~5 중 첫 번째로 열리는 카메라를 반환."""
     for idx in range(6):
         cap = cv2.VideoCapture(idx, cv2.CAP_V4L2)
         if cap.isOpened():
@@ -33,12 +35,13 @@ def _open_usb_camera():
             if ret:
                 cap.set(cv2.CAP_PROP_FRAME_WIDTH,  640)
                 cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)   # 최신 프레임만 유지
                 print(f"[CAM] USB 카메라 발견: /dev/video{idx}")
                 return cap
             cap.release()
     return None
 
-CAMERA_OK = True   # cv2는 항상 있으므로 True; 장치 없으면 thread 내부에서 처리
+CAMERA_OK = True
 
 try:
     import board, busio, adafruit_vl53l0x
@@ -48,39 +51,48 @@ except ImportError:
     print("[WARN] adafruit_vl53l0x 없음 → ToF 비활성")
 
 # ════════════════════════════════════════════════════════
-# ── GPIO 초기화 ─────────────────────────────────────────
+# ── GPIO / pigpio 초기화 ─────────────────────────────────
 # ════════════════════════════════════════════════════════
 if GPIO_OK:
     GPIO.setwarnings(False)
     GPIO.setmode(GPIO.BCM)
-    GPIO.setup(config.ELECTROMAGNET_PIN,  GPIO.OUT, initial=GPIO.LOW)
-    GPIO.setup(config.STEPPER_STEP_PIN,   GPIO.OUT, initial=GPIO.LOW)
-    GPIO.setup(config.STEPPER_DIR_PIN,    GPIO.OUT, initial=GPIO.HIGH)
+    # 전자석 — RPi.GPIO PWM
+    GPIO.setup(config.ELECTROMAGNET_PIN, GPIO.OUT, initial=GPIO.LOW)
     _pwm = GPIO.PWM(config.ELECTROMAGNET_PIN, 1000)
     _pwm.start(0)
-
-    # DFR0438 LED — 항상 ON
+    # LED
     GPIO.setup(config.LED_PIN, GPIO.OUT, initial=GPIO.HIGH)
-
-    # MG992 충전 서보 (50Hz PWM)
-    GPIO.setup(SERVO_CHARGING_PIN, GPIO.OUT, initial=GPIO.LOW)
-    _servo_pwm = GPIO.PWM(SERVO_CHARGING_PIN, SERVO_FREQ_HZ)
-    _servo_pwm.start(0)
+    # 스테퍼 — RPi.GPIO
+    GPIO.setup(config.STEPPER_STEP_PIN, GPIO.OUT, initial=GPIO.LOW)
+    GPIO.setup(config.STEPPER_DIR_PIN,  GPIO.OUT, initial=GPIO.HIGH)
+    if config.STEPPER_EN_PIN is not None:
+        GPIO.setup(config.STEPPER_EN_PIN, GPIO.OUT, initial=GPIO.HIGH)  # 비활성
+    # 서보 — pigpio 우선, 없으면 RPi.GPIO PWM
+    if _pi:
+        _pi.set_mode(SERVO_CHARGING_PIN, pigpio.OUTPUT)
+        _pi.set_servo_pulsewidth(SERVO_CHARGING_PIN, 0)
+        _servo_pwm = None
+    else:
+        GPIO.setup(SERVO_CHARGING_PIN, GPIO.OUT, initial=GPIO.LOW)
+        _servo_pwm = GPIO.PWM(SERVO_CHARGING_PIN, SERVO_FREQ_HZ)
+        _servo_pwm.start(0)
 else:
-    _servo_pwm = None
     _pwm = None
+    _servo_pwm = None
 
+
+# ════════════════════════════════════════════════════════
+# ── 승인 헬퍼 ────────────────────────────────────────────
+# ════════════════════════════════════════════════════════
 def _request_approval(next_state: str):
-    """다음 상태 전이 전 승인 요청. _pending_transition을 설정하고 반환."""
     with shared._lock:
         if shared._pending_transition == next_state:
-            return  # 이미 같은 전이 대기 중
+            return
         shared._pending_transition = next_state
         shared._approved = False
-    print(f"\n[SM] ⏸  [{next_state}] 전이 대기 — 웹 UI에서 APPROVE 클릭 필요")
+    print(f"\n[SM] PENDING [{next_state}] — Enter or APPROVE")
 
 def _check_approved() -> bool:
-    """승인됐으면 True 반환 + 플래그 초기화."""
     with shared._lock:
         if shared._approved:
             shared._approved = False
@@ -89,16 +101,17 @@ def _check_approved() -> bool:
     return False
 
 def _cancel_approval():
-    """대기 중인 승인 취소 (조건 소실 또는 REJECT 시)."""
     with shared._lock:
         if shared._pending_transition is not None:
-            print(f"\n[SM] ✗  [{shared._pending_transition}] 전이 취소")
+            print(f"\n[SM] CANCELLED [{shared._pending_transition}]")
         shared._pending_transition = None
         shared._approved = False
 
 
+# ════════════════════════════════════════════════════════
+# ── 액추에이터 헬퍼 ──────────────────────────────────────
+# ════════════════════════════════════════════════════════
 def _set_magnet(on: bool):
-    """전자석 상태 설정. 이미 해당 상태면 무시."""
     with shared._lock:
         if shared._magnet_on == on:
             return
@@ -117,25 +130,52 @@ def _set_magnet(on: bool):
             shared._magnet_on = False
         print("[MAG] OFF")
 
+
 def _set_motor_target(steps: int):
-    """모터 목표 스텝 설정. 이미 같은 값이면 무시."""
     with shared._lock:
         if shared._motor_target == steps:
             return
         shared._motor_target = steps
     print("[MOT] target ->", steps, "steps")
 
-def _set_servo(angle_deg: float):
-    """MG992 서보 회전. 이미 동일 각도면 무시.
-    PWM 신호를 짧게 인가 후 차단해 발열·지터를 방지한다."""
+
+def _motor_enable(enable):
+    if not GPIO_OK or config.STEPPER_EN_PIN is None:
+        return
+    GPIO.output(config.STEPPER_EN_PIN, GPIO.LOW if enable else GPIO.HIGH)
+
+
+def _step_motor_once(direction, delay):
+    half = delay / 2
+    if _pi:
+        _pi.write(config.STEPPER_DIR_PIN, 0 if direction > 0 else 1)
+        _pi.write(config.STEPPER_STEP_PIN, 1)
+        time.sleep(half)
+        _pi.write(config.STEPPER_STEP_PIN, 0)
+        time.sleep(half)
+    elif GPIO_OK:
+        GPIO.output(config.STEPPER_DIR_PIN, GPIO.LOW if direction > 0 else GPIO.HIGH)
+        GPIO.output(config.STEPPER_STEP_PIN, GPIO.HIGH)
+        time.sleep(half)
+        GPIO.output(config.STEPPER_STEP_PIN, GPIO.LOW)
+        time.sleep(half)
+    else:
+        time.sleep(delay)
+
+
+def _set_servo(angle_deg):
     with shared._lock:
         if shared._servo_angle == angle_deg:
             return
-    if GPIO_OK and _servo_pwm is not None:
-        duty = _angle_to_duty(angle_deg)
+    if _pi:
+        pulse_us = int(500 + (2000.0 * angle_deg / 180.0))
+        pulse_us = max(500, min(2500, pulse_us))
+        _pi.set_servo_pulsewidth(SERVO_CHARGING_PIN, pulse_us)
+        time.sleep(0.8)
+    elif GPIO_OK and _servo_pwm is not None:
+        duty = 2.5 + (10.0 * angle_deg / 180.0)
         _servo_pwm.ChangeDutyCycle(duty)
-        time.sleep(0.5)               # 서보 이동 시간 확보
-        # 신호 유지 — 차단 시 토크 소실로 복귀되는 문제 방지
+        time.sleep(0.8)
     with shared._lock:
         shared._servo_angle = angle_deg
     print("[SVO] ->", angle_deg, "deg")

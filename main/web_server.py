@@ -23,11 +23,11 @@ def gen_frames():
             continue
 
         if frame is prev_frame:
-            time.sleep(0.01)
+            time.sleep(0.033)  # ~30fps cap, CPU 절감
             continue
         prev_frame = frame
 
-        _, buf = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 65])
+        _, buf = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 50])  # 화질 낮춰 전송 속도 향상
         yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n'
                + buf.tobytes() + b'\r\n')
 
@@ -58,6 +58,30 @@ def api_reject():
     _cancel_approval()
     print(f"\n[SM] ✗  [{pending}] 전이 거부됨")
     return jsonify({"ok": True, "rejected": pending})
+
+_STATE_ORDER = [
+    "PRE_DOCKING", "SOFT_CAPTURE", "HARD_LOCK",
+    "DOCKED", "CHARGING",
+    "SEPARATION_1", "SEPARATION_2", "SEPARATION_3"
+]
+
+@app.route('/api/force_next', methods=['POST'])
+def api_force_next():
+    """현재 상태에서 강제로 다음 상태로 전이."""
+    with shared._lock:
+        cur = shared._dock_state
+    try:
+        idx = _STATE_ORDER.index(cur)
+    except ValueError:
+        return jsonify({"ok": False, "msg": "알 수 없는 상태"})
+    if idx >= len(_STATE_ORDER) - 1:
+        return jsonify({"ok": False, "msg": "이미 최종 상태"})
+    next_state = _STATE_ORDER[idx + 1]
+    _cancel_approval()
+    with shared._lock:
+        shared._dock_state = next_state
+    print(f"\n[SM] ★ 강제 전이 → {next_state}")
+    return jsonify({"ok": True, "state": next_state})
 
 @app.route('/api/reset', methods=['POST'])
 def api_reset():
@@ -933,6 +957,7 @@ body {
     </div>
   </div>
 
+  <button id="force-btn" onclick="doForceNext()" style="padding:8px 16px;border:1px solid #f39c12;color:#f39c12;background:transparent;cursor:pointer;font-family:inherit;font-size:11px;letter-spacing:2px;transition:all 0.2s;flex-shrink:0;">&#x23ED; FORCE NEXT</button>
   <button id="reset-btn" onclick="doReset()">&#x27F3; RESET</button>
 </footer>
 
@@ -1249,6 +1274,17 @@ async function doReject() {
 // ─────────────────────────────────────────────
 // Reset button
 // ─────────────────────────────────────────────
+async function doForceNext() {
+  const btn = document.getElementById('force-btn');
+  btn.textContent = '...'; btn.disabled = true;
+  try {
+    const r = await fetch('/api/force_next', { method: 'POST' }).then(r => r.json());
+    if (!r.ok) alert(r.msg);
+    await update();
+  } catch(e) {}
+  setTimeout(() => { btn.textContent = '⏭ FORCE NEXT'; btn.disabled = false; }, 600);
+}
+
 async function doReset() {
   const btn = document.getElementById('reset-btn');
   btn.textContent = '...';
@@ -1261,16 +1297,6 @@ async function doReset() {
   setTimeout(() => { btn.textContent = '&#x27F3; RESET'; btn.disabled = false; }, 900);
 }
 
-// ─────────────────────────────────────────────
-// Clock & polling
-// ─────────────────────────────────────────────
-setInterval(() => {
-  document.getElementById('clock').textContent = new Date().toLocaleString('ko-KR');
-}, 1000);
-
-setInterval(update, 500);
-update();
-
 // ── 키보드 단축키: Enter → APPROVE ──────────────
 document.addEventListener('keydown', (e) => {
   if (e.key === 'Enter' && !e.repeat) {
@@ -1281,9 +1307,16 @@ document.addEventListener('keydown', (e) => {
     }
   }
 });
+
+// ─────────────────────────────────────────────
+// Clock & polling
+// ─────────────────────────────────────────────
+setInterval(() => {
+  document.getElementById('clock').textContent = new Date().toLocaleString('ko-KR');
+}, 1000);
+
+setInterval(update, 500);
+update();
 </script>
 </body>
 </html>"""
-
-# ════════════════════════════════════════════════════════
-# ── 메인 실행 ─────────────────────────────

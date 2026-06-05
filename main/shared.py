@@ -15,8 +15,8 @@ _marker_offset_y = 0.0
 
 # 액추에이터
 _magnet_on    = False
-_motor_steps  = 11000  # 시작 시 완전 연장 위치로 가정
-_motor_target = 11000  # PRE_DOCKING 유지 목표
+_motor_steps  = 6000   # 시작 시 완전 연장 위치로 가정
+_motor_target = 6000   # PRE_DOCKING 유지 목표
 _servo_angle  = 0      # MG992 충전 서보 현재 각도 (deg)
 
 # 상태머신

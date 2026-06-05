@@ -6,12 +6,7 @@ import cv2
 import cv2.aruco as aruco
 from constants import MOTOR_EXTENDED_STEPS, MOTOR_MIN_DELAY, MOTOR_MAX_DELAY, MOTOR_ACCEL_STEPS
 import shared
-from hardware import _set_servo, GPIO_OK, _servo_pwm
-
-try:
-    import RPi.GPIO as GPIO
-except ImportError:
-    GPIO = None
+from hardware import _set_servo, GPIO_OK, _step_motor_once, _motor_enable
 
 def _open_usb_camera():
     """V4L2 인덱스 0~5 중 첫 번째로 열리는 카메라를 반환."""
@@ -20,8 +15,10 @@ def _open_usb_camera():
         if cap.isOpened():
             ret, _ = cap.read()
             if ret:
-                cap.set(cv2.CAP_PROP_FRAME_WIDTH,  640)
-                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+                cap.set(cv2.CAP_PROP_FRAME_WIDTH,  320)   # 해상도 낮춰 딜레이 감소
+                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 240)
+                cap.set(cv2.CAP_PROP_BUFFERSIZE,   1)
+                cap.set(cv2.CAP_PROP_FPS,          15)
                 print(f"[CAM] USB 카메라 발견: /dev/video{idx}")
                 return cap
             cap.release()
@@ -45,7 +42,7 @@ def tof_thread():
         print("[ToF] 라이브러리 없음, 스레드 종료")
         return
     try:
-        i2c    = busio.I2C(board.SCL, board.SDA)
+        i2c    = board.I2C()   # board.I2C()가 올바른 버스 자동 선택
         sensor = adafruit_vl53l0x.VL53L0X(i2c)
         print("[ToF] 초기화 완료")
         while True:
@@ -98,8 +95,8 @@ def camera_thread():
         _det   = None
         use_new_api = False
 
-    FRAME_INTERVAL  = 1.0 / 15   # 카메라 최대 15 fps
-    ARUCO_EVERY_N   = 3          # 3프레임마다 ArUco 감지 (CPU 절감)
+    FRAME_INTERVAL  = 1.0 / 15
+    ARUCO_EVERY_N   = 5          # 5프레임마다 ArUco 감지 (Pi CPU 절감)
     frame_count     = 0
     last_corners    = None
     last_ids        = None
@@ -205,31 +202,22 @@ def motor_thread():
             target  = shared._motor_target
 
         if current == target:
-            # 목표 도달 시 드라이버 비활성화
             if last_target is not None:
-                if GPIO_OK and GPIO and config.STEPPER_EN_PIN is not None:
-                    try:
-                        GPIO.output(config.STEPPER_EN_PIN, GPIO.HIGH)
-                    except Exception:
-                        pass
+                _motor_enable(False)   # 목표 도달 → 드라이버 비활성
             move_count  = 0
             last_target = None
             time.sleep(0.005)
             continue
 
-        # 새 목표 감지 시 드라이버 활성화 + 카운터 리셋
         if target != last_target:
             move_count  = 0
             last_target = target
-            if GPIO_OK and GPIO and config.STEPPER_EN_PIN is not None:
-                try:
-                    GPIO.output(config.STEPPER_EN_PIN, GPIO.LOW)
-                except Exception:
-                    pass
+            _motor_enable(True)        # 새 목표 → 드라이버 활성
 
         direction = 1 if target > current else -1
         remaining = abs(target - current)
 
+        # Trapezoid 가감속
         if move_count < MOTOR_ACCEL_STEPS:
             delay = MOTOR_MAX_DELAY - (MOTOR_MAX_DELAY - MOTOR_MIN_DELAY) * (move_count / MOTOR_ACCEL_STEPS)
         elif remaining < MOTOR_ACCEL_STEPS:
@@ -237,24 +225,14 @@ def motor_thread():
         else:
             delay = MOTOR_MIN_DELAY
 
-        half = delay / 2
-
-        if GPIO_OK and GPIO and shared._running:
-            try:
-                GPIO.output(config.STEPPER_DIR_PIN,
-                            GPIO.LOW if direction > 0 else GPIO.HIGH)
-                GPIO.output(config.STEPPER_STEP_PIN, GPIO.HIGH)
-                time.sleep(half)
-                GPIO.output(config.STEPPER_STEP_PIN, GPIO.LOW)
-                time.sleep(half)
-            except Exception:
-                break
-        else:
-            time.sleep(delay)
+        try:
+            _step_motor_once(direction, delay)
+        except Exception:
+            break
 
         with shared._lock:
             shared._motor_steps += direction
         move_count += 1
 
         if shared._motor_steps % 1000 == 0:
-            print("[MOT] %d / %d steps" % (shared._motor_steps, target), end="\r")
+            print("[MOT]", shared._motor_steps, "/", target)
