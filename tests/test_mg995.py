@@ -23,7 +23,7 @@ FREQ_HZ    = 50
 PERIOD_MS  = 20.0
 
 # ── 펄스 범위 ──────────────────────────────────────────────
-STOP_PULSE = 1.5   # ms
+STOP_PULSE = 1.53   # ms
 MIN_PULSE  = 0.5   # ms (+방향 최대)
 MAX_PULSE  = 2.5   # ms (-방향 최대)
 
